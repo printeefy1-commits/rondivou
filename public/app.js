@@ -9,6 +9,10 @@ const addDays = (date, n) => new Date(new Date(`${date}T12:00:00+01:00`).getTime
 let state, selectedDate = today(), mode = window.innerWidth < 760 ? 'day' : 'week', currentView = 'calendar', currentConversation, toastTimeout;
 const service = id => state?.services.find(s => s.id === id);
 const statusLabel = status => ({ confirmed: 'Confirmé', waiting_confirmation: 'Attente de confirmation', cancelled: 'Annulé' }[status] || status);
+const calendarAccount = a => {
+  const prefix = a.channel === 'instagram' ? 'IG' : a.channel === 'messenger' ? 'FB' : '';
+  return prefix ? `${prefix}: ${a.username || 'Compte non renseigné'}` : a.client_name || a.username || 'Cliente';
+};
 function toast(text) { clearTimeout(toastTimeout); $('#toast').textContent = text; $('#toast').hidden = false; toastTimeout = setTimeout(() => { $('#toast').hidden = true; }, 5500); }
 async function api(path, options = {}) {
   const response = await fetch('/api' + path, { ...options, headers: { 'Content-Type': 'application/json', ...options.headers } });
@@ -72,8 +76,8 @@ function renderCalendar() {
       button.style.setProperty('--top', `${(from - dayStart) / 60000 - first * 60}px`);
       button.style.setProperty('--size', `${Math.max(20, (to - from) / 60000 - 4)}px`);
       button.style.setProperty('--accent', s.color); button.style.setProperty('--tint', `${s.color}23`);
-      button.innerHTML = `<time>${escape(clock(a.start_at))} — ${escape(clock(a.end_at))}</time><strong>${escape(s.name)}</strong><small>${escape(a.client_name || a.username || 'Cliente')}</small>${a.status === 'waiting_confirmation' ? '<i class="waiting-dot"></i>' : ''}`;
-      button.title = `${s.name} · ${a.client_name || a.username || 'Cliente'} · ${statusLabel(a.status)}`;
+      button.innerHTML = `<time>${escape(clock(a.start_at))} — ${escape(clock(a.end_at))}</time><strong>${escape(s.name)}</strong><small>${escape(calendarAccount(a))}</small>${a.status === 'waiting_confirmation' ? '<i class="waiting-dot"></i>' : ''}`;
+      button.title = `${s.name} · ${calendarAccount(a)} · ${statusLabel(a.status)}`;
       button.onclick = () => showAppointment(a);
       $(`[data-date="${d}"]`, calendar).append(button);
     }
