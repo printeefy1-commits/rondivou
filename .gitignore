@@ -4,3 +4,4 @@ node_modules/
 coverage/
 *.log
 .deployment-state.env
+.deployment-ec2-state.env
