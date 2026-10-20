@@ -15,7 +15,7 @@ BASELINES = {
     'src/store.js': {'978fd39b90ba54013f41d5033d47a2abe4a4a490d65c1476fcfc2da92b971469'},
     'src/integrations.js': {'2b1f3e2ddc0100b4ff9e82837a9180482dcff0a280d832d5838ab99f7ef04f82'},
     'src/telegram-cards.js': set(),
-    'public/app.js': {'214eed8c3d7d3c0a23369eddc4fa6673e0fa72eb0097ce872dc740b40bff1734', '33906c0f7d62fbb07d8a4307ce8e5abb035bedcba34ae9297795b4392240836a'},
+    'public/app.js': {'3e90fd92aca52367c19279f3c58f6d4cd154543ebae1c2643d07e681c689f0b9', '214eed8c3d7d3c0a23369eddc4fa6673e0fa72eb0097ce872dc740b40bff1734', '33906c0f7d62fbb07d8a4307ce8e5abb035bedcba34ae9297795b4392240836a'},
     'public/style.css': {'b4c78aed5e2e77211b42ffc65f6904d3ce360c5e370c3fedc868f326ab60b62a'},
     'public/index.html': {'1ef5cdee8591fcd5ac24874594206beab05cd2a5ab59c02e8936f39cfce3fe4b'},
 }
@@ -101,7 +101,7 @@ def main():
             connector.docker('restart', 'rondivou')
             raise
     print('Readable workspace installed. Application health passed.')
-    print('Conversations show the earliest available message date and newest messages first.')
+    print('Conversations show the earliest available message date and latest messages at the bottom; most recently active conversations first.')
     print('Larger text, higher contrast and mobile layouts enabled. Calendar keeps FB:/IG: account labels.')
     print('New messages, profile names and AI results update ONE card per conversation, grouped over about 8 seconds.')
     print('Cards show the last three text previews; the full conversation stays on the website.')
