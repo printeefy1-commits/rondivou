@@ -191,24 +191,25 @@ setInterval(async () => {
 
 
 let styleState, styleLatestTest;
-const styleStatus = status => ({ queued: 'En attente', running: 'Analyse en cours', paused: 'En pause', failed: 'À reprendre', completed: 'Analyse terminée' }[status] || status);
+const styleStatus = status => ({ queued: 'En attente', running: 'Analyse en cours', paused: 'En pause', failed: 'Continuation automatique', completed: 'Analyse terminée' }[status] || status);
 async function loadStyle() {
   styleState = await api('/style');
   const run = styleState.run;
-  const done = styleState.chunks.filter(c => ['done','excluded'].includes(c.status)).length;
+  const done = styleState.chunks.filter(c => ['done','excluded','skipped'].includes(c.status)).length;
   const active = run && ['queued', 'running', 'paused', 'failed'].includes(run.status);
   $('#style-learn').disabled = !styleState.configured || Boolean(active);
   $('#style-learn').textContent = run?.status === 'completed' ? 'Analyser à nouveau tous les imports' : 'Analyser les messages importés';
-  $('#style-pause').hidden = !run || !['queued', 'running'].includes(run.status);
-  $('#style-resume').hidden = !run || !['paused', 'failed'].includes(run.status);
-  $('#style-progress').innerHTML = run ? `<div class="style-run"><strong>${escape(styleStatus(run.status))}</strong><span>${run.message_count} messages · ${done} / ${run.chunk_count} lots examinés</span><progress max="${run.chunk_count}" value="${done}"></progress>${run.error ? `<p class="error">${escape(run.error)}</p>` : ''}</div>` : '<p>Aucune analyse lancée.</p>';
+  $('#style-auto-control').hidden = !active;
+  $('#style-auto').checked = run?.status !== 'paused';
+  const skipped = styleState.chunks.filter(c => c.status === 'skipped').length;
+  $('#style-progress').innerHTML = run ? `<div class="style-run"><strong>${escape(styleStatus(run.status))}</strong><span>${run.message_count} messages · ${done} / ${run.chunk_count} lots traités${skipped ? ` · ${skipped} ignorés (non compris)` : ''}</span><progress max="${run.chunk_count}" value="${done}"></progress>${run.error ? `<p class="error">${escape(run.error)}</p>` : ''}${run.retry_at ? `<small>Nouvelle tentative automatique à ${escape(format(run.retry_at, { timeStyle: 'short', hour12: false }))}.</small>` : ''}</div>` : '<p>Aucune analyse lancée.</p>';
   if (!styleState.configured) $('#style-error').textContent = 'Configurez la connexion IA sur le serveur.';
   const retained = styleState.chunks.filter(c => c.status === 'done' && c.result?.classification === 'salon');
   const rules = [...new Set(retained.flatMap(c => c.result.rules))];
   $('#style-rules').innerHTML = rules.length ? `<h3>Style observé · ${retained.length} lots retenus</h3><ul>${rules.slice(0, 24).map(r => `<li>${escape(r)}</li>`).join('')}</ul>` : '<p>Les observations de style apparaîtront ici après analyse des échanges du salon.</p>';
   $('#style-source-count').textContent = styleState.chunks.length;
   const labels = {salon:'Salon',personal:'Personnel / achats',mixed:'Mixte — écarté',uncertain:'Incertain — écarté'};
-  $('#style-sources').innerHTML = styleState.chunks.length ? styleState.chunks.map(c => `<article class="style-source"><div><strong>${escape(c.channel === 'instagram' ? 'IG' : 'FB')}: ${escape(c.username)}</strong><span class="tag">${escape(c.status === 'excluded' ? 'Exclu manuellement' : c.status === 'pending' ? 'En attente' : c.status === 'failed' ? 'À reprendre' : labels[c.result?.classification] || 'À vérifier')}</span>${c.status === 'failed' ? `<p class="error">${escape(c.result?.error || 'Analyse à reprendre.')}</p>` : ''}</div><div class="candidate-actions"><button class="outline small" data-style-open="${c.conversation_id}">Voir l’échange</button>${c.status !== 'excluded' ? `<button class="outline small" data-style-exclude="${c.id}">Exclure ce lot</button>` : ''}</div></article>`).join('') : '<p>Aucune source à examiner.</p>';
+  $('#style-sources').innerHTML = styleState.chunks.length ? styleState.chunks.map(c => `<article class="style-source"><div><strong>${escape(c.channel === 'instagram' ? 'IG' : 'FB')}: ${escape(c.username)}</strong><span class="tag">${escape(c.status === 'excluded' ? 'Exclu manuellement' : c.status === 'pending' ? 'En attente' : c.status === 'skipped' ? 'Non compris — ignoré' : c.status === 'failed' ? 'Continuation automatique' : labels[c.result?.classification] || 'À vérifier')}</span>${c.status === 'failed' ? `<p class="error">${escape(c.result?.error || 'Analyse à reprendre.')}</p>` : ''}</div><div class="candidate-actions"><button class="outline small" data-style-open="${c.conversation_id}">Voir l’échange</button>${c.status !== 'excluded' ? `<button class="outline small" data-style-exclude="${c.id}">Exclure ce lot</button>` : ''}</div></article>`).join('') : '<p>Aucune source à examiner.</p>';
   $$('[data-style-open]').forEach(b => b.onclick = () => { switchView('messages'); openConversation(b.dataset.styleOpen); });
   $$('[data-style-exclude]').forEach(b => b.onclick = async () => { b.disabled = true; try { await api('/style/chunks/' + b.dataset.styleExclude + '/exclude', { method:'POST', body:'{}' }); await loadStyle(); } catch(e) { $('#style-error').textContent=e.message; } });
   if (!styleLatestTest && styleState.tests.length) { styleLatestTest = styleState.tests[0]; renderStyleTest(); }
@@ -222,6 +223,6 @@ function renderStyleTest() {
   $('#style-save-correction').onclick=()=>save('corrected',$('#style-correction').value);
 }
 $('#style-learn').onclick=async event=>{ event.target.disabled=true; $('#style-error').textContent=''; try { await api('/style/learn',{method:'POST',body:'{}'}); await loadStyle(); } catch(e) { $('#style-error').textContent=e.message; event.target.disabled=false; } };
-for (const action of ['pause','resume']) $('#style-'+action).onclick=async()=>{ try { await api('/style/runs/'+styleState.run.id+'/'+action,{method:'POST',body:'{}'}); await loadStyle(); } catch(e) { $('#style-error').textContent=e.message; } };
+$('#style-auto').onchange=async event=>{ const action=event.target.checked?'resume':'pause';event.target.disabled=true;try{await api('/style/runs/'+styleState.run.id+'/'+action,{method:'POST',body:'{}'});await loadStyle();}catch(e){$('#style-error').textContent=e.message;event.target.checked=!event.target.checked;}finally{event.target.disabled=false;} };
 $('#style-refresh').onclick=()=>loadStyle().catch(e=>{$('#style-error').textContent=e.message;});
 $('#style-test-form').onsubmit=async event=>{event.preventDefault();const b=$('#style-test-submit');b.disabled=true;b.textContent='Réponse en cours…';$('#style-test-error').textContent='';try{styleLatestTest=await api('/style/test',{method:'POST',body:JSON.stringify({message:$('#style-test-message').value})});renderStyleTest();}catch(e){$('#style-test-error').textContent=e.message;}finally{b.disabled=false;b.textContent='Essayer une réponse ✦';}};

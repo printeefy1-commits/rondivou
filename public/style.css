@@ -205,3 +205,5 @@ input:focus, select:focus, textarea:focus { outline-color: #69bca8; }
   .style-sources { padding: 20px 16px; }
 }
 @media (min-width: 761px) { .sidebar { overflow-y: auto; scrollbar-width: thin; } }
+.style-auto-control { display: inline-flex; align-items: center; gap: 9px; margin: 0; padding: 10px 0; }
+#style-auto { width: 20px; height: 20px; min-height: 20px; margin: 0; accent-color: var(--green); }

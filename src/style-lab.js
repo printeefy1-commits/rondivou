@@ -16,30 +16,42 @@ export function redactStyle(text, identities = []) {
 const priceQuestion = text => /\b(prix|tarifs?|combien|cout(?:e|ent)?|ch[7h]al|chhal|ch7al|bch7al|bchhal|price|cost|gratuit|promotion|promo|remise)\b|بشحال|شحال|بقداه|بكم|السعر|سعر|ثمن|تسوام/i.test(text);
 const safeText = (text, max = 1000) => typeof text === 'string' && text.length <= max;
 const classification = new Set(['salon', 'personal', 'uncertain', 'mixed']);
+class ProviderError extends Error {}
+const ignored = JSON.stringify({classification:'uncertain',rules:[],examples:[],note:'Lot non compris : ignoré automatiquement.'});
+const providerFailure = error => /^(Connexion IA|Service IA indisponible|Configurez la connexion IA)/.test(error || '');
 
 export function styleLab(store, config, request = fetch) {
   store.run("UPDATE style_runs SET status='queued',error=NULL WHERE status='running'");
+  // Continue older stopped runs without discarding their successful batches.
+  for (const run of store.all("SELECT id,error FROM style_runs WHERE status='failed'")) {
+    for (const chunk of store.all("SELECT id,result FROM style_chunks WHERE run_id=? AND status='failed'",run.id)) {
+      let error = run.error;
+      try { error = JSON.parse(chunk.result)?.error || error; } catch {}
+      store.run('UPDATE style_chunks SET status=?,result=? WHERE id=?', providerFailure(error) ? 'pending' : 'skipped', providerFailure(error) ? null : ignored, chunk.id);
+    }
+    store.run("UPDATE style_runs SET status='queued',error=NULL WHERE id=?",run.id);
+  }
   let processing = false;
   async function model(system, data, maxTokens = 2200) {
-    if (!aiEnabled(config)) throw new Error('Configurez la connexion IA avant de continuer.');
+    if (!aiEnabled(config)) throw new ProviderError('Configurez la connexion IA avant de continuer.');
     let response;
     try {
       response = await request(aiEndpoint(config.AI_BASE_URL), { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(60000),
         headers: { Authorization: `Bearer ${config.AI_API_KEY}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: config.AI_MODEL || 'auto', temperature: 0, max_tokens: maxTokens, stream: false,
           response_format: { type: 'json_object' }, messages: [{ role: 'system', content: system }, { role: 'user', content: JSON.stringify(data) }] }) });
-    } catch { throw new Error('Connexion IA indisponible. Vous pouvez reprendre l’analyse.'); }
-    if (!response.ok) throw new Error(`Service IA indisponible (HTTP ${response.status}).`);
+    } catch { throw new ProviderError('Connexion IA indisponible.'); }
+    if (!response.ok) throw new ProviderError(`Service IA indisponible (HTTP ${response.status}).`);
     try {
       const body = await response.json();
       if (body.choices?.[0]?.finish_reason !== 'stop') throw new Error();
       return JSON.parse(body.choices[0].message.content);
-    } catch { throw new Error('Réponse IA invalide ou incomplète. Reprenez l’analyse pour réessayer.'); }
+    } catch { throw new Error('Réponse IA invalide ou incomplète.'); }
   }
   function start() {
     if (!aiEnabled(config)) throw Object.assign(new Error('Configurez la connexion IA.'), { status: 409 });
     const active = store.get("SELECT id FROM style_runs WHERE status IN ('queued','running','paused','failed') ORDER BY created_at DESC LIMIT 1");
-    if (active) throw Object.assign(new Error('Une analyse existe déjà : reprenez-la ou terminez-la avant de recommencer.'), { status: 409 });
+    if (active) throw Object.assign(new Error('Une analyse existe déjà. Elle continue automatiquement si l’analyse automatique est activée.'), { status: 409 });
     const conversations = store.all("SELECT c.* FROM conversations c WHERE EXISTS(SELECT 1 FROM messages m WHERE m.conversation_id=c.id AND m.historical=1) ORDER BY c.created_at,c.id");
     const chunks = [];
     let messageCount = 0;
@@ -69,7 +81,7 @@ export function styleLab(store, config, request = fetch) {
     return id;
   }
   function validateChunk(data, messages) {
-    if (!classification.has(data?.classification) || !Array.isArray(data.rules) || !Array.isArray(data.examples) || data.rules.length > 8 || data.examples.length > 4) throw new Error('Analyse de style invalide. Reprenez pour réessayer.');
+    if (!classification.has(data?.classification) || !Array.isArray(data.rules) || !Array.isArray(data.examples) || data.rules.length > 8 || data.examples.length > 4) throw new Error('Analyse de style invalide.');
     if (data.classification !== 'salon') return { classification: data.classification, rules: [], examples: [] };
     if (data.rules.some(r => !safeText(r, 400))) throw new Error('Observation de style invalide.');
     const rules = data.rules.map(r => redactStyle(r)).filter(r => !/\[nombre\]|\[nom\]|\b(prix|tarifs?|promotion|adresse|horaires?|dinars?|dzd|euros?|mille)\b|دينار|دج|ألف|الف/iu.test(r));
@@ -87,6 +99,8 @@ export function styleLab(store, config, request = fetch) {
     if (processing) return;
     const run = store.get("SELECT * FROM style_runs WHERE status IN ('queued','running') ORDER BY created_at LIMIT 1");
     if (!run) return;
+    const retry = store.get('SELECT * FROM style_retries WHERE run_id=?',run.id);
+    if (retry && retry.next_at > store.now()) return;
     const chunk = store.get("SELECT * FROM style_chunks WHERE run_id=? AND status='pending' ORDER BY rowid LIMIT 1", run.id);
     if (!chunk) { store.run("UPDATE style_runs SET status='completed',error=NULL WHERE id=?", run.id); return; }
     processing = true;
@@ -97,17 +111,30 @@ export function styleLab(store, config, request = fetch) {
 For salon ONLY, describe tone, Darija/French code-switching, spelling, length, greeting and closing habits of OUT replies. Preserve the salon's actual style; do not correct it into formal French. Never extract facts, historical prices, discounts, addresses, contacts, schedules, availability or client identities. Rules describe linguistic style only. For mixed/personal/uncertain return empty rules/examples. Examples must use an EXACT complete out message as answer and its id as source_id; question may be a short generic paraphrase without private details. Never select answers with prices or identifying details.
 Return JSON: {"classification":"salon|personal|mixed|uncertain","rules":["style observation"],"examples":[{"question":"generic client question","answer":"exact out text","source_id":"id"}]}. Maximum 8 rules, 4 examples.`, { messages });
       const result = validateChunk(data, messages);
+      store.run('DELETE FROM style_retries WHERE run_id=?',run.id);
+      store.run("UPDATE style_runs SET error=NULL WHERE id=?",run.id);
       // A user exclusion while this call was running takes precedence.
       store.run("UPDATE style_chunks SET status='done',result=? WHERE id=? AND status='pending'", JSON.stringify(result), chunk.id);
       if (!store.get("SELECT id FROM style_chunks WHERE run_id=? AND status='pending'", run.id)) store.run("UPDATE style_runs SET status='completed',error=NULL WHERE id=? AND status='running'", run.id);
     } catch (e) {
-      store.run("UPDATE style_chunks SET status='failed',result=? WHERE id=? AND status='pending'", JSON.stringify({error:e.message}),chunk.id);
-      store.run("UPDATE style_runs SET status='failed',error=? WHERE id=? AND status='running'", e.message, run.id);
+      if (e instanceof ProviderError) {
+        const attempts = (retry?.attempts || 0) + 1;
+        const next = new Date(Date.now()+Math.min(300000,15000*2**Math.min(attempts-1,5))).toISOString();
+        store.run('INSERT INTO style_retries VALUES(?,?,?) ON CONFLICT(run_id) DO UPDATE SET next_at=excluded.next_at,attempts=excluded.attempts',run.id,next,attempts);
+        store.run("UPDATE style_runs SET status='queued',error=? WHERE id=? AND status='running'",e.message + ' Nouvelle tentative automatique.',run.id);
+      } else {
+        // Unusable/model-unclear output contributes no style and never blocks later batches.
+        store.run("UPDATE style_chunks SET status='skipped',result=? WHERE id=? AND status='pending'",ignored,chunk.id);
+        store.run('DELETE FROM style_retries WHERE run_id=?',run.id);
+        store.run('UPDATE style_runs SET error=NULL WHERE id=?',run.id);
+        if (!store.get("SELECT id FROM style_chunks WHERE run_id=? AND status='pending'",run.id)) store.run("UPDATE style_runs SET status='completed',error=NULL WHERE id=? AND status='running'",run.id);
+      }
     }
     finally { processing = false; }
   }
   function report() {
     const run = store.get('SELECT * FROM style_runs ORDER BY created_at DESC,rowid DESC LIMIT 1');
+    if (run) run.retry_at = store.get('SELECT next_at FROM style_retries WHERE run_id=?',run.id)?.next_at || null;
     const chunks = run ? store.all('SELECT s.id,s.conversation_id,s.status,s.result,c.username,c.channel FROM style_chunks s JOIN conversations c ON c.id=s.conversation_id WHERE s.run_id=? ORDER BY s.rowid', run.id).map(s => ({ ...s, result: s.result && JSON.parse(s.result) })) : [];
     return { configured: aiEnabled(config), run, chunks, tests: store.all('SELECT * FROM style_tests ORDER BY created_at DESC,rowid DESC LIMIT 20') };
   }

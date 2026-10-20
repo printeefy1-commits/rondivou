@@ -55,11 +55,11 @@ test('personal, mixed and uncertain chunks never supply style examples even if m
   }
 });
 
-test('invented or incoming-only example answers fail without marking a batch complete',async t=>{
+test('invented or incoming-only examples are skipped without becoming learned style',async t=>{
   const {store,lab,add}=fixture(t,data=>({classification:'salon',rules:[],examples:[{source_id:data.messages[0].id,question:'Slm',answer:data.messages[0].text}]}));
   add('Message cliente');lab.start();await lab.tick();
-  assert.equal(store.get('SELECT status FROM style_runs').status,'failed');
-  assert.equal(store.get('SELECT status FROM style_chunks').status,'failed');
+  assert.equal(store.get('SELECT status FROM style_runs').status,'completed');
+  assert.equal(store.get('SELECT status FROM style_chunks').status,'skipped');
 });
 
 test('old prices are excluded from examples; price tests defer to a human without invoking model',async t=>{
@@ -156,4 +156,59 @@ test('re-imported webhook texts join the learning corpus without duplicate messa
   assert.equal(store.get('SELECT COUNT(*) AS n FROM outbox').n,count);
   assert.equal(store.get('SELECT COUNT(*) AS n FROM appointments').n,0);
   lab.start();assert.equal(store.get('SELECT message_count FROM style_runs').message_count,1);
+});
+
+test('an invalid style batch is skipped and later batches continue automatically',async t=>{
+  let n=0;
+  const {store,lab,add}=fixture(t,data=>++n===1?{classification:'salon',rules:[{invalid:'object'}],examples:[]}:salon(data));
+  for(let i=0;i<40;i++)add('Slm hbiba',i%2?'out':'in');
+  lab.start();await lab.tick();
+  assert.equal(store.get("SELECT COUNT(*) AS n FROM style_chunks WHERE status='skipped'").n,1);
+  assert.equal(store.get('SELECT status FROM style_runs').status,'running');
+  await lab.tick();
+  assert.equal(store.get('SELECT status FROM style_runs').status,'completed');
+  assert.equal(store.get("SELECT COUNT(*) AS n FROM style_chunks WHERE status='done'").n,1);
+  assert.equal(store.get('SELECT status FROM style_runs').status,'completed');
+});
+
+test('upgrading an old stopped run keeps finished batches and skips the failed unclear batch',async t=>{
+  const {store,lab,add,request,calls}=fixture(t,salon);
+  for(let i=0;i<65;i++)add('Bonjour balayage ?',i%2?'out':'in');
+  lab.start();await lab.tick();
+  const failed=store.get("SELECT id FROM style_chunks WHERE status='pending' ORDER BY rowid LIMIT 1");
+  store.run("UPDATE style_chunks SET status='failed',result=? WHERE id=?",JSON.stringify({error:'Observation de style invalide.'}),failed.id);
+  store.run("UPDATE style_runs SET status='failed',error='Observation de style invalide.'");
+  const next=styleLab(store,config,request);
+  assert.equal(store.get("SELECT COUNT(*) AS n FROM style_chunks WHERE status='done'").n,1);
+  assert.equal(store.get("SELECT COUNT(*) AS n FROM style_chunks WHERE status='skipped'").n,1);
+  await next.tick();
+  assert.equal(calls.length,2);
+  assert.equal(store.get('SELECT status FROM style_runs').status,'completed');
+});
+
+test('provider failure waits then retries the same pending batch without skipping any messages',async t=>{
+  const {store,add}=fixture(t,salon);
+  add('Slm');add('Slm hbiba','out');
+  let count=0;
+  const request=async(_url,options)=>{
+    count++;
+    if(count===1)return new Response('{}',{status:429});
+    const data=JSON.parse(JSON.parse(options.body).messages[1].content);
+    return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify(salon(data))}}]}));
+  };
+  const lab=styleLab(store,config,request);lab.start();await lab.tick();
+  assert.equal(store.get('SELECT status FROM style_chunks').status,'pending');
+  assert.equal(store.get('SELECT status FROM style_runs').status,'queued');
+  assert.ok(lab.report().run.retry_at);await lab.tick();assert.equal(count,1);
+  store.run("UPDATE style_retries SET next_at='2000-01-01T00:00:00Z'");await lab.tick();
+  assert.equal(count,2);assert.equal(store.get('SELECT status FROM style_runs').status,'completed');
+  assert.equal(store.get('SELECT COUNT(*) AS n FROM style_retries').n,0);
+});
+
+test('a legacy failed network request becomes pending instead of being skipped during upgrade',t=>{
+  const {store,lab,add,request}=fixture(t,salon);add('Bonjour');lab.start();
+  store.run("UPDATE style_chunks SET status='failed',result=?",JSON.stringify({error:'Service IA indisponible (HTTP 401).'}));
+  store.run("UPDATE style_runs SET status='failed'");styleLab(store,config,request);
+  assert.equal(store.get('SELECT status FROM style_chunks').status,'pending');
+  assert.equal(store.get('SELECT status FROM style_runs').status,'queued');
 });
