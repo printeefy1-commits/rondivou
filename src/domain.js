@@ -26,6 +26,9 @@ export function extract(messages, now = new Date()) {
   for (const message of messages) {
     const t = normalize(message.text);
     const reference = new Date(message.sent_at || now);
+    const months = ['janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre'];
+    const writtenDate = new RegExp(`\\b(\\d{1,2})(?:er)?\\s+(${months.join('|')})(?:\\s+(20\\d{2}))?\\b`, 'g');
+    for (const m of t.matchAll(writtenDate)) dates.add(`${m[3] || algeriaDate(reference).slice(0, 4)}-${String(months.indexOf(m[2]) + 1).padStart(2, '0')}-${m[1].padStart(2, '0')}`);
     for (const [id, regex] of Object.entries(patterns)) if (regex.test(t)) services.add(id);
     for (const m of t.matchAll(/\b(20\d{2})-(\d{2})-(\d{2})\b/g)) dates.add(`${m[1]}-${m[2]}-${m[3]}`);
     for (const m of t.matchAll(/\b(\d{1,2})[/.](\d{1,2})(?:[/.](20\d{2}))?\b/g)) dates.add(`${m[3] || algeriaDate(reference).slice(0, 4)}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`);

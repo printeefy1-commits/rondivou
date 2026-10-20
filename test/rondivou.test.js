@@ -26,6 +26,20 @@ test('conflicting dates or multiple services force manual review', () => {
   const candidate = extract([{ text: `${future} ou 2030-06-11 à 10h coiffure ou coloration` }]);
   assert.equal(candidate.ambiguous, true); assert.equal(candidate.complete, false);
 });
+test('written French dates use message year and retain ambiguity between services', () => {
+  const message = { text: 'Bonjour, je voudrais un rendez-vous pour une coloration le 23 octobre à 10h. , pour balayage', sent_at: '2026-10-20T16:16:00Z' };
+  const result = extract([message]);
+  assert.equal(result.date, '2026-10-23');
+  assert.equal(result.time, '10:00');
+  assert.equal(result.service, '');
+  assert.equal(result.ambiguous, true);
+  assert.equal(result.complete, false);
+  const single = extract([{ ...message, text: 'Balayage le 1er août 2030 à 08h' }]);
+  assert.equal(single.date, '2030-08-01');
+  assert.equal(single.complete, true);
+  assert.equal(extract([{ ...message, text: 'Balayage le 31 février à 10h' }]).complete, false);
+  assert.equal(extract([{ ...message, text: 'Balayage le 23 octobre ou 24/10 à 10h' }]).ambiguous, true);
+});
 test('negated confirmations and questions do not create an agreement', () => {
   for (const text of ['Je ne confirme pas', 'Pouvez-vous confirmer ?', 'موعدك مؤكد؟', 'لا اكد الموعد', 'pas confirmé']) assert.equal(isAgreement(text), false, text);
 });
