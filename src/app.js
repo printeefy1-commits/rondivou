@@ -3,6 +3,7 @@ import { randomBytes, scryptSync, timingSafeEqual, createHmac } from 'node:crypt
 import { resolve } from 'node:path';
 import { SERVICES } from './domain.js';
 import { integrations } from './integrations.js';
+import { aiEnabled } from './ai.js';
 
 export function createApp(store, config, request, audit = record => console.info(JSON.stringify(record))) {
   const app = express();
@@ -102,7 +103,14 @@ export function createApp(store, config, request, audit = record => console.info
   app.get('/api/conversations/:id', (req, res) => {
     const c = store.get('SELECT * FROM conversations WHERE id=?', req.params.id);
     if (!c) return res.sendStatus(404);
-    res.json({ ...c, messages: store.all('SELECT * FROM messages WHERE conversation_id=? ORDER BY sent_at,rowid', c.id), candidate: store.candidate(c.id), reviews: store.all("SELECT * FROM reviews WHERE conversation_id=? AND status='pending'", c.id) });
+    const candidate = store.candidate(c.id);
+    res.json({ ...c, messages: store.all('SELECT * FROM messages WHERE conversation_id=? ORDER BY sent_at,rowid', c.id), candidate: { ...candidate, ai_pending: aiEnabled(config) && candidate.source !== 'ai' && store.context(c.id).length > 0 }, reviews: store.all("SELECT * FROM reviews WHERE conversation_id=? AND status='pending'", c.id) });
+  });
+  app.post('/api/conversations/:id/analyze', (req, res) => {
+    if (!aiEnabled(config)) return res.status(409).json({ error: 'Configurez la connexion IA sur le serveur.' });
+    if (!store.get('SELECT id FROM conversations WHERE id=?', req.params.id)) return res.sendStatus(404);
+    integration.queueAnalysis(req.params.id);
+    res.json({ queued: true });
   });
   app.post('/api/conversations/:id/dismiss', (req, res) => { store.run("UPDATE reviews SET status='dismissed' WHERE conversation_id=?", req.params.id); res.json({ ok: true }); });
   function validateBooking(body) {

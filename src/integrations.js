@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { extract, isAgreement, isChange } from './domain.js';
+import { analyze, aiEnabled, contextKey } from './ai.js';
 
 export function integrations(store, config, request = fetch) {
   const graphVersion = config.META_GRAPH_VERSION || 'v23.0';
@@ -26,6 +27,10 @@ export function integrations(store, config, request = fetch) {
   }
   function review(c, message, reason) {
     store.run('INSERT OR IGNORE INTO reviews(id,conversation_id,message_id,reason,created_at) VALUES(?,?,?,?,?)', randomUUID(), c.id, message.id, reason, store.now());
+  }
+  function queueAnalysis(conversationId) {
+    if (!aiEnabled(config) || !store.context(conversationId).length) return;
+    if (!store.get("SELECT id FROM outbox WHERE kind='ai_extract' AND sent_at IS NULL AND json_extract(payload,'$.conversationId')=?", conversationId)) store.enqueue('ai_extract', { conversationId });
   }
   function ingest({ channel, externalId, username, messageId, text, direction, sentAt, historical = false }) {
     if (!text?.trim()) return { ignored: true };
@@ -56,6 +61,11 @@ export function integrations(store, config, request = fetch) {
       store.notify('confirmation', `${c.username} a confirmé sa présence.`);
       store.enqueue('telegram', { text: `✅ ${c.username} a confirmé sa présence.` });
       return { conversation_id: c.id, message_id: id, attendanceConfirmed: true };
+    }
+    if (aiEnabled(config)) {
+      review(c, message, historical ? 'historical' : 'ai_pending');
+      queueAnalysis(c.id);
+      return { conversation_id: c.id, message_id: id, ai_pending: true };
     }
     const candidate = store.candidate(c.id);
     const changed = store.context(c.id).some(m => isChange(m.text));
@@ -102,7 +112,8 @@ export function integrations(store, config, request = fetch) {
       // Explicit preview is mandatory for ambiguous/incomplete data and ALL historical imports.
       const historical = store.context(c.id).some(m => m.historical);
       const changeRequested = store.context(c.id).some(m => isChange(m.text));
-      if (match[1] === 'confirm' && candidate.complete && !historical && !changeRequested) {
+      if (aiEnabled(config) && candidate.source !== 'ai') queueAnalysis(c.id);
+      if (match[1] === 'confirm' && candidate.complete && !historical && !changeRequested && !candidate.change_requested && (!aiEnabled(config) || candidate.source === 'ai')) {
         const latest = store.context(c.id).at(-1);
         if (!latest) return;
         try { store.book({ ...candidate, conversation_id: c.id, source_message_id: latest.id }); }
@@ -118,6 +129,35 @@ export function integrations(store, config, request = fetch) {
     store.run('INSERT OR IGNORE INTO telegram_updates VALUES(?)', updateId);
   }
   let working = false;
+  async function analyzeConversation(conversationId) {
+    const c = store.get('SELECT * FROM conversations WHERE id=?', conversationId);
+    const messages = store.context(conversationId);
+    if (!c || !messages.length || !aiEnabled(config)) return;
+    const key = contextKey(messages);
+    const result = await analyze(messages, config, request);
+    // Messages or manual bookings may arrive while the model is responding.
+    // A stale result must never update the form or create a booking.
+    if (contextKey(store.context(conversationId)) !== key) {
+      if (store.context(conversationId).length) store.enqueue('ai_extract', { conversationId });
+      return;
+    }
+    store.run('INSERT INTO ai_analyses VALUES(?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET context_key=excluded.context_key,result=excluded.result,created_at=excluded.created_at', c.id, key, JSON.stringify(result), store.now());
+    const historical = messages.some(m => m.historical);
+    const existing = store.get("SELECT id FROM appointments WHERE conversation_id=? AND status!='cancelled' AND start_at>?", c.id, store.now());
+    const changed = result.change_requested || messages.some(m => isChange(m.text));
+    let reason = historical ? 'historical' : existing || changed ? 'change_requested' : result.ambiguous ? 'ambiguous' : !result.complete ? 'missing_info' : 'agreement_needed';
+    if (result.complete && result.agreement && !historical && !existing && !changed) {
+      try {
+        store.book({ ...result, conversation_id: c.id, source_message_id: messages.at(-1).id });
+        return;
+      } catch (e) {
+        reason = e.status === 409 ? 'conflict' : 'needs_review';
+        store.notify('warning', `${c.username} : ${e.message}`);
+      }
+    }
+    store.run("UPDATE reviews SET reason=? WHERE conversation_id=? AND status='pending' AND reason='ai_pending'", reason, c.id);
+    store.enqueue('telegram', { text: `📋 Analyse IA · ${c.username}\nDate : ${result.date || 'à compléter'}\nHeure : ${result.time || 'à compléter'}\nPrestation : ${result.service || 'à compléter'}\n${historical ? 'Historique : validation manuelle obligatoire.' : reason === 'conflict' ? 'Créneau indisponible : vérification nécessaire.' : existing || changed ? 'Rendez-vous existant ou modification : vérification nécessaire.' : result.ambiguous ? 'Informations ambiguës : vérification nécessaire.' : !result.complete ? 'Informations manquantes : complétez le formulaire.' : 'En attente d’un accord clair ou de votre validation.'}`, reply_markup: buttons(c.id) });
+  }
   async function flush() {
     if (working) return;
     working = true;
@@ -127,12 +167,16 @@ export function integrations(store, config, request = fetch) {
         try {
           const payload = JSON.parse(job.payload);
           if (job.kind === 'telegram') await telegram('sendMessage', { chat_id: config.TELEGRAM_ADMIN_ID, ...payload });
+          else if (job.kind === 'ai_extract') await analyzeConversation(payload.conversationId);
           else if (job.kind === 'meta_profile') {
             const c = store.get('SELECT * FROM conversations WHERE id=?', payload.conversationId);
             if (c) {
               const profile = await graph(c.external_id, { fields: c.channel === 'instagram' ? 'name,username' : 'first_name,last_name' });
               const name = profile.username || profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' ');
-              if (name) store.run('UPDATE conversations SET username=? WHERE id=?', name, c.id);
+              if (name) {
+                store.run('UPDATE conversations SET username=? WHERE id=?', name, c.id);
+                store.enqueue('telegram', { text: `👤 ${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${name}\nProfil identifié pour la conversation ${c.external_id}.`, reply_markup: buttons(c.id) });
+              }
             }
           }
           else if (job.kind === 'meta_reminder') {
@@ -149,7 +193,7 @@ export function integrations(store, config, request = fetch) {
         } catch (e) {
           const attempts = job.attempts + 1;
           store.run('UPDATE outbox SET attempts=?,next_at=?,error=? WHERE id=?', attempts, new Date(Date.now() + Math.min(3600000, 30000 * 2 ** Math.min(attempts, 7))).toISOString(), e.message, job.id);
-          if (attempts === 1) store.notify('warning', `${job.kind === 'meta_profile' ? 'Lecture du profil Meta' : job.kind === 'telegram' ? 'Envoi Telegram' : 'Envoi du rappel Meta'} impossible. Vérifiez la connexion et les permissions dans les paramètres.`);
+          if (attempts === 1) store.notify('warning', `${job.kind === 'ai_extract' ? 'Analyse IA' : job.kind === 'meta_profile' ? 'Lecture du profil Meta' : job.kind === 'telegram' ? 'Envoi Telegram' : 'Envoi du rappel Meta'} impossible. Vérifiez la connexion et les permissions dans les paramètres.`);
         }
       }
     } finally { working = false; }
@@ -202,5 +246,5 @@ export function integrations(store, config, request = fetch) {
     store.notify('import', `${imported} messages importés. Validation manuelle obligatoire avant tout ajout.`);
     return imported;
   }
-  return { ingest, metaEvents, telegramEvent, telegram, graph, flush, scheduleReminders, importHistory };
+  return { ingest, metaEvents, telegramEvent, telegram, graph, flush, scheduleReminders, importHistory, queueAnalysis };
 }

@@ -3,6 +3,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { appointmentTimes, extract } from './domain.js';
+import { contextKey } from './ai.js';
 export function createStore(path = '.data/rondivou.sqlite') {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
@@ -15,6 +16,7 @@ export function createStore(path = '.data/rondivou.sqlite') {
     CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL, sent_at TEXT, error TEXT);
     CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS telegram_updates(id TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS ai_analyses(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), context_key TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS appointment_range ON appointments(start_at,end_at);
     CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id,sent_at);
   `);
@@ -52,10 +54,17 @@ export function createStore(path = '.data/rondivou.sqlite') {
       else run('INSERT INTO appointments(id,conversation_id,source_message_id,client_name,phone,service,start_at,end_at,status,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', id, input.conversation_id || null, input.source_message_id || null, input.client_name || '', input.phone || '', input.service, start, end, 'confirmed', input.notes || '', stamp, stamp);
       if (input.conversation_id) run("UPDATE reviews SET status='resolved' WHERE conversation_id=? AND status='pending'", input.conversation_id);
       const a = get('SELECT * FROM appointments WHERE id=?', id);
+      const account = input.conversation_id && get('SELECT username,channel FROM conversations WHERE id=?', input.conversation_id);
       notify('booking', `${updateId ? 'Rendez-vous modifié' : 'Nouveau rendez-vous'} · ${input.date} à ${input.time} · ${input.service}`);
-      enqueue('telegram', { text: `✅ ${updateId ? 'Rendez-vous modifié' : 'Rendez-vous confirmé'}\n${input.date} à ${input.time} · ${input.service}\n${input.client_name || 'Nom non renseigné'}` });
+      enqueue('telegram', { text: `✅ ${updateId ? 'Rendez-vous modifié' : 'Rendez-vous confirmé'}\n${input.date} à ${input.time} · ${input.service}\n${input.client_name || 'Nom non renseigné'}${account ? `\n${account.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${account.username}` : ''}` });
       db.exec('COMMIT'); return a;
     } catch (e) { db.exec('ROLLBACK'); throw e; }
   }
-  return { db, all, get, run, now, notify, enqueue, conversation, context, book, candidate: id => extract(context(id)), close: () => db.close() };
+  function candidate(id) {
+    const messages = context(id);
+    const analysis = get('SELECT * FROM ai_analyses WHERE conversation_id=?', id);
+    if (analysis && analysis.context_key === contextKey(messages)) return JSON.parse(analysis.result);
+    return extract(messages);
+  }
+  return { db, all, get, run, now, notify, enqueue, conversation, context, book, candidate, close: () => db.close() };
 }
