@@ -1,13 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { extract, isAgreement, isChange } from './domain.js';
 import { analyze, aiEnabled, contextKey } from './ai.js';
+import { telegramCards } from './telegram-cards.js';
 
 export function integrations(store, config, request = fetch) {
   const graphVersion = config.META_GRAPH_VERSION || 'v23.0';
   async function api(url, options) {
     const response = await request(url, { ...options, signal: AbortSignal.timeout(20000) });
     const data = await response.json();
-    if (!response.ok || data.ok === false || data.error) throw new Error(`Échec du service distant (${response.status}, code ${data.error?.code || data.error_code || 'inconnu'}).`);
+    if (!response.ok || data.ok === false || data.error) {
+      const error = new Error(`Échec du service distant (${response.status}, code ${data.error?.code || data.error_code || 'inconnu'}).`);
+      if (data.error_code === 400 && /^Bad Request: message is not modified\b/i.test(data.description || '')) error.telegramState = 'not_modified';
+      if (data.error_code === 400 && /^Bad Request: (message to edit not found|message can't be edited)\b/i.test(data.description || '')) error.telegramState = 'missing_message';
+      throw error;
+    }
     return data.result ?? data;
   }
   async function telegram(method, body) {
@@ -25,6 +31,7 @@ export function integrations(store, config, request = fetch) {
   function buttons(conversationId) {
     return { inline_keyboard: [[{ text: 'rondivou', callback_data: `plan:${conversationId}` }, { text: 'rondivou confirmé', callback_data: `confirm:${conversationId}` }]] };
   }
+  const cards = telegramCards(store, config, telegram, buttons);
   function review(c, message, reason) {
     store.run('INSERT OR IGNORE INTO reviews(id,conversation_id,message_id,reason,created_at) VALUES(?,?,?,?,?)', randomUUID(), c.id, message.id, reason, store.now());
   }
@@ -46,7 +53,8 @@ export function integrations(store, config, request = fetch) {
     }
     // Every text is forwarded, including the manager's replies, without Telegram HTML parsing.
     const chars = Array.from(text);
-    for (let offset = 0; offset < chars.length; offset += 2800) {
+    if (cards.enabled) cards.queue(c.id);
+    for (let offset = 0; !cards.enabled && offset < chars.length; offset += 2800) {
       store.enqueue('telegram', { text: `${historical ? '🗂 Historique · ' : ''}${channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.username}\n${direction === 'out' ? 'Salon' : 'Cliente'} · ${new Intl.DateTimeFormat('fr-DZ', { timeZone: 'Africa/Algiers', dateStyle: 'short', timeStyle: 'short' }).format(stamp)}${chars.length > 2800 ? ` · partie ${offset / 2800 + 1}` : ''}\n\n${chars.slice(offset, offset + 2800).join('')}`, reply_markup: buttons(c.id) });
     }
     const waiting = store.all("SELECT * FROM appointments WHERE conversation_id=? AND status='waiting_confirmation' AND start_at>? ORDER BY start_at", c.id, store.now());
@@ -60,6 +68,7 @@ export function integrations(store, config, request = fetch) {
       store.run("UPDATE appointments SET status='confirmed',updated_at=? WHERE id=?", store.now(), waiting[0].id);
       store.notify('confirmation', `${c.username} a confirmé sa présence.`);
       store.enqueue('telegram', { text: `✅ ${c.username} a confirmé sa présence.` });
+      cards.queue(c.id);
       return { conversation_id: c.id, message_id: id, attendanceConfirmed: true };
     }
     if (aiEnabled(config)) {
@@ -105,7 +114,7 @@ export function integrations(store, config, request = fetch) {
     if (callback) {
       const match = /^(plan|confirm):([\w-]+)$/.exec(callback.data || '');
       if (!match) return;
-      await telegram('answerCallbackQuery', { callback_query_id: callback.id });
+      await telegram('answerCallbackQuery', { callback_query_id: callback.id, ...(cards.enabled && match[1] === 'plan' ? { text: 'Utilisez « Ouvrir sur le site » dans la carte pour compléter le formulaire.' } : {}) });
       const c = store.get('SELECT * FROM conversations WHERE id=?', match[2]);
       if (!c) return;
       const candidate = store.candidate(c.id);
@@ -116,12 +125,13 @@ export function integrations(store, config, request = fetch) {
       if (match[1] === 'confirm' && candidate.complete && !historical && !changeRequested && !candidate.change_requested && (!aiEnabled(config) || candidate.source === 'ai')) {
         const latest = store.context(c.id).at(-1);
         if (!latest) return;
-        try { store.book({ ...candidate, conversation_id: c.id, source_message_id: latest.id }); }
+        try { store.book({ ...candidate, conversation_id: c.id, source_message_id: latest.id }); cards.queue(c.id); }
         catch (e) { store.enqueue('telegram', { text: e.message }); }
       } else {
         const url = new URL('/?conversation=' + c.id, config.PUBLIC_URL || 'http://localhost:3000');
         const markup = url.protocol === 'https:' ? { inline_keyboard: [[{ text: 'Ouvrir le formulaire · rondivou', url: url.href }]] } : undefined;
-        store.enqueue('telegram', { text: `📋 ${c.username}\nDate : ${candidate.date || 'à compléter'}\nHeure : ${candidate.time || 'à compléter'}\nPrestation : ${candidate.service || 'à compléter'}\n${historical ? 'Historique : validation manuelle obligatoire.\n' : ''}${changeRequested ? 'Modification ou annulation : vérifiez le rendez-vous existant dans le calendrier.\n' : ''}Ouvrez le formulaire sécurisé du salon pour vérifier et envoyer.${markup ? '' : '\nConfigurez PUBLIC_URL en HTTPS pour activer le lien.'}`, reply_markup: markup });
+        if (cards.enabled) cards.queue(c.id);
+        else store.enqueue('telegram', { text: `📋 ${c.username}\nDate : ${candidate.date || 'à compléter'}\nHeure : ${candidate.time || 'à compléter'}\nPrestation : ${candidate.service || 'à compléter'}\n${historical ? 'Historique : validation manuelle obligatoire.\n' : ''}${changeRequested ? 'Modification ou annulation : vérifiez le rendez-vous existant dans le calendrier.\n' : ''}Ouvrez le formulaire sécurisé du salon pour vérifier et envoyer.${markup ? '' : '\nConfigurez PUBLIC_URL en HTTPS pour activer le lien.'}`, reply_markup: markup });
       }
     } else if (body.message?.text) {
       store.enqueue('telegram', { text: 'Bienvenue dans Rondivou. Les messages du salon apparaîtront ici après connexion de Meta. Utilisez « rondivou » pour ouvrir le formulaire ou « rondivou confirmé » pour valider les informations complètes. Les conversations anciennes nécessitent toujours une vérification.' });
@@ -141,6 +151,8 @@ export function integrations(store, config, request = fetch) {
       if (store.context(conversationId).length) store.enqueue('ai_extract', { conversationId });
       return;
     }
+    const previousAnalysis = store.get('SELECT result FROM ai_analyses WHERE conversation_id=?', c.id);
+    const previousConflict = store.get("SELECT id FROM reviews WHERE conversation_id=? AND status='pending' AND reason='conflict'", c.id);
     store.run('INSERT INTO ai_analyses VALUES(?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET context_key=excluded.context_key,result=excluded.result,created_at=excluded.created_at', c.id, key, JSON.stringify(result), store.now());
     const historical = messages.some(m => m.historical);
     const existing = store.get("SELECT id FROM appointments WHERE conversation_id=? AND status!='cancelled' AND start_at>?", c.id, store.now());
@@ -149,6 +161,7 @@ export function integrations(store, config, request = fetch) {
     if (result.complete && result.agreement && !historical && !existing && !changed) {
       try {
         store.book({ ...result, conversation_id: c.id, source_message_id: messages.at(-1).id });
+        cards.queue(c.id);
         return;
       } catch (e) {
         reason = e.status === 409 ? 'conflict' : 'needs_review';
@@ -156,7 +169,11 @@ export function integrations(store, config, request = fetch) {
       }
     }
     store.run("UPDATE reviews SET reason=? WHERE conversation_id=? AND status='pending' AND reason='ai_pending'", reason, c.id);
-    store.enqueue('telegram', { text: `📋 Analyse IA · ${c.username}\nDate : ${result.date || 'à compléter'}\nHeure : ${result.time || 'à compléter'}\nPrestation : ${result.service || 'à compléter'}\n${historical ? 'Historique : validation manuelle obligatoire.' : reason === 'conflict' ? 'Créneau indisponible : vérification nécessaire.' : existing || changed ? 'Rendez-vous existant ou modification : vérification nécessaire.' : result.ambiguous ? 'Informations ambiguës : vérification nécessaire.' : !result.complete ? 'Informations manquantes : complétez le formulaire.' : 'En attente d’un accord clair ou de votre validation.'}`, reply_markup: buttons(c.id) });
+    if (cards.enabled) {
+      cards.queue(c.id);
+      const previous = previousAnalysis && JSON.parse(previousAnalysis.result);
+      if (reason === 'conflict' && (!previousConflict || previous?.date !== result.date || previous?.time !== result.time || previous?.service !== result.service)) store.enqueue('telegram', { text: `⚠️ ${c.username} : créneau indisponible le ${result.date} à ${result.time}.`, reply_markup: buttons(c.id) });
+    } else store.enqueue('telegram', { text: `📋 Analyse IA · ${c.username}\nDate : ${result.date || 'à compléter'}\nHeure : ${result.time || 'à compléter'}\nPrestation : ${result.service || 'à compléter'}\n${historical ? 'Historique : validation manuelle obligatoire.' : reason === 'conflict' ? 'Créneau indisponible : vérification nécessaire.' : existing || changed ? 'Rendez-vous existant ou modification : vérification nécessaire.' : result.ambiguous ? 'Informations ambiguës : vérification nécessaire.' : !result.complete ? 'Informations manquantes : complétez le formulaire.' : 'En attente d’un accord clair ou de votre validation.'}`, reply_markup: buttons(c.id) });
   }
   async function flush() {
     if (working) return;
@@ -166,7 +183,8 @@ export function integrations(store, config, request = fetch) {
       for (const job of jobs) {
         try {
           const payload = JSON.parse(job.payload);
-          if (job.kind === 'telegram') await telegram('sendMessage', { chat_id: config.TELEGRAM_ADMIN_ID, ...payload });
+          if (job.kind === 'telegram' && !cards.absorbLegacy(payload)) await telegram('sendMessage', { chat_id: config.TELEGRAM_ADMIN_ID, ...payload });
+          else if (job.kind === 'telegram_card') await cards.deliver(payload.conversationId);
           else if (job.kind === 'ai_extract') await analyzeConversation(payload.conversationId);
           else if (job.kind === 'meta_profile') {
             const c = store.get('SELECT * FROM conversations WHERE id=?', payload.conversationId);
@@ -175,7 +193,8 @@ export function integrations(store, config, request = fetch) {
               const name = profile.username || profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' ');
               if (name) {
                 store.run('UPDATE conversations SET username=? WHERE id=?', name, c.id);
-                store.enqueue('telegram', { text: `👤 ${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${name}\nProfil identifié pour la conversation ${c.external_id}.`, reply_markup: buttons(c.id) });
+                if (cards.enabled) cards.queue(c.id);
+                else store.enqueue('telegram', { text: `👤 ${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${name}\nProfil identifié pour la conversation ${c.external_id}.`, reply_markup: buttons(c.id) });
               }
             }
           }
@@ -246,5 +265,5 @@ export function integrations(store, config, request = fetch) {
     store.notify('import', `${imported} messages importés. Validation manuelle obligatoire avant tout ajout.`);
     return imported;
   }
-  return { ingest, metaEvents, telegramEvent, telegram, graph, flush, scheduleReminders, importHistory, queueAnalysis };
+  return { ingest, metaEvents, telegramEvent, telegram, graph, flush, scheduleReminders, importHistory, queueAnalysis, refreshCard: cards.queue };
 }

@@ -23,7 +23,7 @@ function setup(t, makeAnswer = m => answer(m), extra = {}) {
       const messages = JSON.parse(body.messages[1].content).messages;
       return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(await makeAnswer(messages)) } }] }), { status: 200 });
     }
-    return new Response(JSON.stringify({ ok: true, result: {} }), { status: 200 });
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 123 } }), { status: 200 });
   };
   const integration = integrations(store, { ...config, ...extra }, request);
   const ingest = (value = text, additions = {}) => integration.ingest({ channel: 'instagram', externalId: 'scope-id', username: 'actual_ig_username', text: value, direction: 'in', messageId: String(calls.length) + value, sentAt: '2030-10-20T08:00:00Z', ...additions });
@@ -147,4 +147,20 @@ test('AI URL validation prevents credentials in URLs or insecure remote endpoint
   assert.throws(() => aiEndpoint('http://gateway.example/v1'));
   assert.throws(() => aiEndpoint('https://secret@gateway.example/v1'));
   assert.throws(() => aiEndpoint('https://gateway.example/v1?key=secret'));
+});
+
+
+test('compact mode folds AI results into one card and retains a distinct booking alert', async t => {
+  const { store, ingest, drain, calls, integration } = setup(t, m => answer(m, { agreement: true }), { TELEGRAM_COMPACT: 'true' });
+  ingest();
+  ingest('Oui je confirme', { messageId: 'accept-client', sentAt: '2030-10-20T08:01:00Z' });
+  ingest('Votre rendez-vous est confirmé', { direction: 'out', messageId: 'accept-salon', sentAt: '2030-10-20T08:02:00Z' });
+  await drain();
+  store.run("UPDATE outbox SET next_at='2000-01-01T00:00:00Z' WHERE kind='telegram_card'");
+  await drain();
+  assert.equal(store.get('SELECT COUNT(*) AS n FROM appointments').n, 1);
+  const sent = calls.filter(c => c.url.endsWith('/sendMessage'));
+  assert.equal(sent.length, 2); // booking alert + conversation card, no AI/profile/raw-message flood
+  assert.ok(sent.some(c => JSON.parse(c.options.body).text.startsWith('✅ Rendez-vous confirmé')));
+  assert.equal(store.get('SELECT COUNT(*) AS n FROM telegram_cards').n, 1);
 });

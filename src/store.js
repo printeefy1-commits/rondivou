@@ -17,6 +17,7 @@ export function createStore(path = '.data/rondivou.sqlite') {
     CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS telegram_updates(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS ai_analyses(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), context_key TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS telegram_cards(conversation_id TEXT NOT NULL REFERENCES conversations(id), chat_id TEXT NOT NULL, message_id TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(conversation_id,chat_id));
     CREATE INDEX IF NOT EXISTS appointment_range ON appointments(start_at,end_at);
     CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id,sent_at);
   `);

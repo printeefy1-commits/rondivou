@@ -123,8 +123,8 @@ export function createApp(store, config, request, audit = record => console.info
     if (input.source_message_id && !store.get('SELECT id FROM messages WHERE id=? AND conversation_id=?', input.source_message_id, input.conversation_id)) throw Object.assign(new Error('Message source invalide.'), { status: 400 });
     return input;
   }
-  app.post('/api/appointments', (req, res, next) => { try { res.status(201).json(store.book(validateBooking(req.body))); } catch (e) { next(e); } });
-  app.put('/api/appointments/:id', (req, res, next) => { try { res.json(store.book(validateBooking(req.body), { updateId: req.params.id })); } catch (e) { next(e); } });
+  app.post('/api/appointments', (req, res, next) => { try { const a = store.book(validateBooking(req.body)); if (a.conversation_id) integration.refreshCard(a.conversation_id); res.status(201).json(a); } catch (e) { next(e); } });
+  app.put('/api/appointments/:id', (req, res, next) => { try { const a = store.book(validateBooking(req.body), { updateId: req.params.id }); if (a.conversation_id) integration.refreshCard(a.conversation_id); res.json(a); } catch (e) { next(e); } });
   app.patch('/api/appointments/:id/status', (req, res) => {
     if (!['cancelled', 'confirmed', 'waiting_confirmation'].includes(req.body.status)) return res.sendStatus(400);
     const a = store.get('SELECT * FROM appointments WHERE id=?', req.params.id);
@@ -135,6 +135,7 @@ export function createApp(store, config, request, audit = record => console.info
     }
     store.run('UPDATE appointments SET status=?,updated_at=? WHERE id=?', req.body.status, store.now(), req.params.id);
     store.notify('status', `Statut du rendez-vous mis à jour : ${req.body.status}`);
+    if (a.conversation_id) integration.refreshCard(a.conversation_id);
     res.json({ ok: true });
   });
   app.post('/api/notifications/read', (_req, res) => { store.run('UPDATE notifications SET read_at=? WHERE read_at IS NULL', store.now()); res.json({ ok: true }); });
