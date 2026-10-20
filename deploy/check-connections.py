@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Meta diagnostics; optional explicit Messenger subscription repair. No tokens are printed."""
+"""Meta diagnostics; optional explicit Messenger or Instagram subscription setup. No tokens are printed."""
 import argparse
 import json
 import os
@@ -55,18 +55,17 @@ def summarize_subscriptions(app_result, page_result, expected_callback, app_id):
     return {'application_webhooks': app_summary, 'facebook_page_subscription': page_summary}
 
 
-def repair_messenger(settings, base, app_result):
-    """Add required events only, preserving any existing Page events and other objects."""
+def repair_app_subscription(settings, base, app_result, object_name, required):
+    """Add required events to one object, preserving its events and other objects."""
     if app_result.get('diagnostic_error') or not isinstance(app_result.get('data'), list):
         return {'status': 'blocked', 'reason': 'Could not read existing subscriptions. No update attempted.'}, app_result
     callback = settings.get('PUBLIC_URL', '').rstrip('/') + '/webhooks/meta'
     if not callback.startswith('https://') or not settings.get('META_VERIFY_TOKEN'):
         return {'status': 'blocked', 'reason': 'HTTPS callback or verification token missing. No update attempted.'}, app_result
-    pages = [item for item in app_result['data'] if item.get('object') == 'page']
+    pages = [item for item in app_result['data'] if item.get('object') == object_name]
     if len(pages) > 1 or any(item.get('callback_url') != callback for item in pages):
-        return {'status': 'blocked', 'reason': 'Existing Page callback differs or is ambiguous. No update attempted.'}, app_result
+        return {'status': 'blocked', 'reason': 'Existing callback differs or is ambiguous. No update attempted.'}, app_result
     current = set(field_names(pages[0].get('fields', []))) if pages else set()
-    required = {'messages', 'message_echoes'}
     if required <= current and pages[0].get('active'):
         return {'status': 'already_configured'}, app_result
     fields = sorted(current | required)
@@ -75,19 +74,79 @@ def repair_messenger(settings, base, app_result):
     app_id = settings['META_APP_ID']
     bearer = app_id + '|' + settings['META_APP_SECRET']
     result = graph(base, app_id + '/subscriptions', bearer, {
-        'object': 'page', 'callback_url': callback, 'verify_token': settings['META_VERIFY_TOKEN'],
+        'object': object_name, 'callback_url': callback, 'verify_token': settings['META_VERIFY_TOKEN'],
         'fields': ','.join(fields)})
     if result.get('success') is not True:
         return {'status': 'update_failed', 'details': result.get('diagnostic_error', 'No success acknowledgment.')}, app_result
     updated = graph(base, app_id + '/subscriptions', bearer)
-    verified = any(item.get('object') == 'page' and item.get('active') and item.get('callback_url') == callback
+    verified = any(item.get('object') == object_name and item.get('active') and item.get('callback_url') == callback
                    and required <= set(field_names(item.get('fields', []))) for item in updated.get('data', []))
     return {'status': 'updated_and_verified' if verified else 'update_accepted_check_subscription_again'}, updated
 
 
+def repair_messenger(settings, base, app_result):
+    return repair_app_subscription(settings, base, app_result, 'page', {'messages', 'message_echoes'})
+
+
+def repair_instagram(settings, base, app_result):
+    instagram_id = settings.get('META_INSTAGRAM_ID', '')
+    if not instagram_id.isdigit():
+        return {'status': 'blocked', 'reason': 'Numeric linked Instagram ID missing. Nothing changed.'}, app_result
+    token = settings['META_PAGE_ACCESS_TOKEN']
+    page = graph(base, settings['META_PAGE_ID'] + '?' + urllib.parse.urlencode({'fields': 'instagram_business_account'}), token)
+    if page.get('diagnostic_error') or str((page.get('instagram_business_account') or {}).get('id')) != instagram_id:
+        return {'status': 'blocked', 'reason': 'Could not verify that this Instagram account belongs to the configured Page. Nothing changed.',
+                'details': page.get('diagnostic_error')}, app_result
+    # Facebook Login delivers messaging via the linked Page subscription.
+    # /IG_ID/subscribed_apps is the separate Instagram Login route, not this connector.
+    path = settings['META_PAGE_ID'] + '/subscribed_apps'
+    query = '?' + urllib.parse.urlencode({'fields': 'id,subscribed_fields'})
+    account_result = graph(base, path + query, token)
+    if account_result.get('diagnostic_error') or not isinstance(account_result.get('data'), list):
+        return {'status': 'blocked', 'reason': 'Could not read linked Page subscriptions. Nothing changed.',
+                'details': account_result.get('diagnostic_error')}, app_result
+    app_id = settings['META_APP_ID']
+    matched = [item for item in account_result['data'] if str(item.get('id')) == app_id]
+    if len(matched) > 1:
+        return {'status': 'blocked', 'reason': 'Ambiguous linked Page subscriptions. Nothing changed.'}, app_result
+    application, app_result = repair_app_subscription(settings, base, app_result, 'instagram', {'messages'})
+    report = {'application': application}
+    if application['status'] not in ['updated_and_verified', 'already_configured']:
+        report['linked_page'] = {'status': 'not_changed', 'reason': 'Application subscription must be verified first.'}
+        return report, app_result
+    if matched and 'subscribed_fields' not in matched[0]:
+        report['linked_page'] = {'status': 'app_present_fields_not_exposed', 'reason': 'Existing Page subscription preserved. Confirm delivery with a real test message.'}
+        return report, app_result
+    current = set(field_names(matched[0].get('subscribed_fields', []))) if matched else set()
+    required_account = {'messages', 'message_echoes'}
+    if required_account <= current:
+        report['linked_page'] = {'status': 'already_configured'}
+        return report, app_result
+    fields = sorted(current | required_account)
+    if not all(re.fullmatch(r'[a-z][a-z0-9_]*', field) for field in fields):
+        report['linked_page'] = {'status': 'blocked', 'reason': 'Unknown Page event format; existing subscription preserved.'}
+        return report, app_result
+    response = graph(base, path, token, {'subscribed_fields': ','.join(fields)})
+    if response.get('success') is not True:
+        report['linked_page'] = {'status': 'update_failed', 'details': response.get('diagnostic_error', 'No success acknowledgment.')}
+        return report, app_result
+    verified = graph(base, path + query, token)
+    own = [item for item in verified.get('data', []) if str(item.get('id')) == app_id]
+    if own and required_account <= set(field_names(own[0].get('subscribed_fields', []))):
+        status = 'updated_and_verified'
+    elif own:
+        status = 'update_accepted_app_present_check_fields'
+    else:
+        status = 'update_accepted_check_page_again'
+    report['linked_page'] = {'status': status}
+    return report, app_result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--repair-messenger', action='store_true', help='Add messages and message_echoes to this app Page webhook, preserving existing events.')
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--repair-messenger', action='store_true', help='Add messages and message_echoes to this app Page webhook, preserving existing events.')
+    actions.add_argument('--repair-instagram', action='store_true', help='Enable the Instagram app webhook and verify messaging via its linked Facebook Page, preserving Messenger.')
     args = parser.parse_args()
     if os.geteuid() != 0:
         raise SystemExit('Run with sudo python3 inside EC2 SSH.')
@@ -116,6 +175,8 @@ def main():
         app_result = graph(base, app_id + '/subscriptions', app_id + '|' + settings['META_APP_SECRET'])
         if args.repair_messenger:
             report['messenger_repair'], app_result = repair_messenger(settings, base, app_result)
+        if args.repair_instagram:
+            report['instagram_repair'], app_result = repair_instagram(settings, base, app_result)
         fields = urllib.parse.urlencode({'fields': 'id,subscribed_fields'})
         page_result = graph(base, settings['META_PAGE_ID'] + '/subscribed_apps?' + fields, settings['META_PAGE_ACCESS_TOKEN'])
         callback = settings.get('PUBLIC_URL', '').rstrip('/') + '/webhooks/meta'
