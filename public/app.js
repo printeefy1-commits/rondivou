@@ -49,6 +49,7 @@ function render() {
   renderCalendar(); renderFollow(); renderConversationList(); renderSettings(); renderNotifications();
 }
 function renderCalendar() {
+  const hourHeight = 84;
   const dayOfWeek = new Date(`${selectedDate}T12:00:00+01:00`).getUTCDay();
   const start = mode === 'day' ? selectedDate : addDays(selectedDate, -((dayOfWeek + 6) % 7));
   const dates = Array.from({ length: mode === 'day' ? 1 : 7 }, (_, i) => addDays(start, i));
@@ -63,8 +64,8 @@ function renderCalendar() {
   }
   const calendar = $('#calendar');
   calendar.style.setProperty('--days', dates.length);
-  calendar.style.setProperty('--min-width', mode === 'week' ? '580px' : '0px');
-  calendar.style.setProperty('--height', `${(last - first) * 60}px`);
+  calendar.style.setProperty('--min-width', mode === 'week' ? '840px' : '0px');
+  calendar.style.setProperty('--height', `${(last - first) * hourHeight}px`);
   calendar.innerHTML = `<div class="calendar-head"><div></div>${dates.map(d => `<div class="day-heading ${d === today() ? 'today' : ''}"><small>${escape(format(`${d}T12:00:00+01:00`, { weekday: 'short' }))}</small><strong>${Number(d.slice(-2))}</strong></div>`).join('')}</div><div class="calendar-grid"><div class="time-axis">${Array.from({ length: last - first }, (_, i) => `<span class="hour-label" data-hour="${i}">${String(first + i).padStart(2, '0')}:00</span>`).join('')}</div>${dates.map(d => `<div class="day-column ${d === today() ? 'is-today' : ''}" data-date="${d}">${Array.from({ length: last - first }, (_, i) => `<button class="slot-button" data-hour="${i}" data-time="${String(first + i).padStart(2, '0')}:00" aria-label="Ajouter un rendez-vous le ${d} à ${first + i} heures"></button>`).join('')}</div>`).join('')}</div>`;
   $$('[data-hour]', calendar).forEach(e => e.style.setProperty('--hour', e.dataset.hour));
   $$('.slot-button', calendar).forEach(b => b.onclick = () => openBooking({ date: b.parentElement.dataset.date, time: b.dataset.time }));
@@ -73,8 +74,8 @@ function renderCalendar() {
     for (const a of visible.filter(a => new Date(a.start_at).getTime() < dayEnd && new Date(a.end_at).getTime() > dayStart)) {
       const s = service(a.service), from = Math.max(dayStart, new Date(a.start_at).getTime()), to = Math.min(dayEnd, new Date(a.end_at).getTime());
       const button = document.createElement('button'); button.className = 'appointment';
-      button.style.setProperty('--top', `${(from - dayStart) / 60000 - first * 60}px`);
-      button.style.setProperty('--size', `${Math.max(20, (to - from) / 60000 - 4)}px`);
+      button.style.setProperty('--top', `${((from - dayStart) / 60000 - first * 60) * hourHeight / 60}px`);
+      button.style.setProperty('--size', `${Math.max(28, (to - from) / 60000 * hourHeight / 60 - 4)}px`);
       button.style.setProperty('--accent', s.color); button.style.setProperty('--tint', `${s.color}23`);
       button.innerHTML = `<time>${escape(clock(a.start_at))} — ${escape(clock(a.end_at))}</time><strong>${escape(s.name)}</strong><small>${escape(calendarAccount(a))}</small>${a.status === 'waiting_confirmation' ? '<i class="waiting-dot"></i>' : ''}`;
       button.title = `${s.name} · ${calendarAccount(a)} · ${statusLabel(a.status)}`;
@@ -93,23 +94,27 @@ function renderFollow() {
   $$('[data-appointment]', $('#follow-list')).forEach(b => b.onclick = () => showAppointment(state.appointments.find(a => a.id === b.dataset.appointment)));
 }
 function renderConversationList() {
-  $('#conversation-list').innerHTML = state.conversations.length ? state.conversations.map(c => `<button class="conversation-card ${currentConversation === c.id ? 'selected' : ''}" data-id="${c.id}"><strong>${escape(c.username)}</strong><small>${c.channel === 'instagram' ? 'Instagram' : 'Messenger'}${c.review_count ? ' · À vérifier' : ''}</small><p>${escape(c.last_text)}</p></button>`).join('') : '<div class="empty-state"><span>↗</span><h3>Votre prochain échange arrive bientôt.</h3><p>Connectez Meta pour recevoir vos conversations.</p><button id="empty-connect" class="outline">Configurer les connexions</button></div>';
+  $('#conversation-list').innerHTML = state.conversations.length ? state.conversations.map(c => `<button class="conversation-card ${currentConversation === c.id ? 'selected' : ''}" data-id="${c.id}"><div class="conversation-card-top"><strong>${escape(c.username)}</strong><span class="channel-badge ${c.channel === 'instagram' ? 'instagram' : 'facebook'}">${c.channel === 'instagram' ? 'IG' : 'FB'}</span></div><small>${c.review_count ? '<span class="review-dot"></span> À vérifier · ' : ''}Dernier échange : ${escape(c.last_at ? format(c.last_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }) : '—')}</small><small class="conversation-start" title="Date du premier message disponible dans Rondivou">Début : ${escape(format(c.started_at || c.created_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }))}</small><p>${escape(c.last_text)}</p></button>`).join('') : '<div class="empty-state"><span>↗</span><h3>Votre prochain échange arrive bientôt.</h3><p>Connectez Meta pour recevoir vos conversations.</p><button id="empty-connect" class="outline">Configurer les connexions</button></div>';
   $$('.conversation-card').forEach(b => b.onclick = () => openConversation(b.dataset.id));
   if ($('#empty-connect')) $('#empty-connect').onclick = () => switchView('settings');
 }
 async function openConversation(id) {
   try {
+    const changingConversation = currentConversation !== id;
+    const previousList = !changingConversation && $('.message-list');
+    const previousScroll = previousList ? previousList.scrollTop : 0;
     currentConversation = id; renderConversationList();
     const c = await api('/conversations/' + id);
     const candidate = c.candidate;
     const historical = c.reviews.some(r => r.reason === 'historical');
     const latest = c.messages.at(-1);
-    $('#conversation-detail').innerHTML = `<div class="conversation-header"><div><h2>${escape(c.username)}</h2><small>${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.messages.length} messages</small></div><button class="outline small" id="dismiss-review">Marquer comme traité</button></div><div class="message-list">${c.messages.map(m => `<div class="message ${m.direction === 'out' ? 'out' : ''}" dir="auto"><small>${m.direction === 'out' ? 'Salon' : 'Cliente'} · ${escape(format(m.sent_at, { dateStyle: 'short', timeStyle: 'short' }))}${m.historical ? ' · Historique' : ''}</small>${escape(m.text)}</div>`).join('')}</div><div class="candidate-panel"><div class="candidate-values"><span>◷ ${escape(candidate.date || 'Date manquante')}</span><span>${escape(candidate.time || 'Heure manquante')}</span><span>${escape(service(candidate.service)?.name || 'Prestation manquante')}</span></div><p>${candidate.ai_pending ? 'Analyse IA en attente. Vous pouvez compléter le formulaire manuellement.' : historical ? 'Historique : vérifiez le contexte et la date avant de créer un rendez-vous.' : candidate.ambiguous ? 'Plusieurs informations possibles : sélectionnez les bonnes valeurs dans le formulaire.' : 'Vérifiez les informations avant de confirmer le rendez-vous.'}</p><div class="candidate-actions">${candidate.source === 'ai' || candidate.ai_pending ? '<button class="outline" id="analyze-conversation">Analyser avec IA</button>' : ''}<button class="primary" id="plan-conversation">rondivou ↗</button><button class="outline" id="confirm-conversation">rondivou confirmé</button></div></div>`;
+    $('#conversation-detail').innerHTML = `<div class="conversation-header"><div><h2>${escape(c.username)}</h2><small>${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.messages.length} messages</small><small class="conversation-start">Début des échanges disponibles : ${escape(format(c.started_at || c.messages[0]?.sent_at || c.created_at, { dateStyle: 'long', timeStyle: 'short', hour12: false }))}</small><span class="message-order">↓ Messages récents en premier</span></div><button class="outline small" id="dismiss-review">Marquer comme traité</button></div><div class="message-list">${[...c.messages].reverse().map(m => `<div class="message ${m.direction === 'out' ? 'out' : ''}" dir="auto"><small>${m.direction === 'out' ? 'Salon' : 'Cliente'} · ${escape(format(m.sent_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }))}${m.historical ? ' · Historique' : ''}</small>${escape(m.text)}</div>`).join('')}</div><div class="candidate-panel"><div class="candidate-values"><span>◷ ${escape(candidate.date || 'Date manquante')}</span><span>${escape(candidate.time || 'Heure manquante')}</span><span>${escape(service(candidate.service)?.name || 'Prestation manquante')}</span></div><p>${candidate.ai_pending ? 'Analyse IA en attente. Vous pouvez compléter le formulaire manuellement.' : historical ? 'Historique : vérifiez le contexte et la date avant de créer un rendez-vous.' : candidate.ambiguous ? 'Plusieurs informations possibles : sélectionnez les bonnes valeurs dans le formulaire.' : 'Vérifiez les informations avant de confirmer le rendez-vous.'}</p><div class="candidate-actions">${candidate.source === 'ai' || candidate.ai_pending ? '<button class="outline" id="analyze-conversation">Analyser avec IA</button>' : ''}<button class="primary" id="plan-conversation">rondivou ↗</button><button class="outline" id="confirm-conversation">rondivou confirmé</button></div></div>`;
     if ($('#analyze-conversation')) $('#analyze-conversation').onclick = async () => { try { await api(`/conversations/${id}/analyze`, { method: 'POST', body: '{}' }); toast('Analyse IA programmée.'); } catch (e) { toast(e.message); } };
     const plan = () => openBooking({ ...candidate, conversation_id: c.id, source_message_id: latest?.id || '', context: `${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.username}${historical ? ' · Import historique : validation manuelle' : ''}` });
     $('#plan-conversation').onclick = plan; $('#confirm-conversation').onclick = plan;
     $('#dismiss-review').onclick = async () => { try { await api(`/conversations/${id}/dismiss`, { method: 'POST', body: '{}' }); await refresh(); toast('Conversation marquée comme traitée.'); } catch (e) { toast(e.message); } };
-    $('.message-list').scrollTop = $('.message-list').scrollHeight;
+    $('.message-list').scrollTop = previousScroll;
+    if (changingConversation && window.innerWidth <= 760) $('#conversation-detail').scrollIntoView({ block: 'start' });
   } catch (e) { toast(e.message); }
 }
 function renderSettings() {

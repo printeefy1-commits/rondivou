@@ -213,3 +213,24 @@ test('Meta webhook audit distinguishes rejected and accepted requests without ex
   assert.equal(store.get('SELECT COUNT(*) AS n FROM messages').n, 1);
   for (const secret of ['PRIVATE', 'private-sender', 'private-page', 'fixture-app-secret', signature]) assert.ok(!JSON.stringify(records).includes(secret));
 });
+
+test('conversation start comes from earliest available message, with latest-active conversations first', async t => {
+  const store = createStore(':memory:');
+  const { app, integration } = createApp(store, { ADMIN_PASSWORD: 'fixture-password' });
+  const older = integration.ingest(incoming({ externalId: 'old-conv', messageId: 'first-live', text: 'Bonjour', sentAt: '2030-06-10T08:00:00Z' }));
+  integration.ingest(incoming({ externalId: 'old-conv', messageId: 'imported-older', text: 'Ancien échange', historical: true, sentAt: '2030-05-20T08:00:00Z' }));
+  const newer = integration.ingest(incoming({ externalId: 'new-conv', messageId: 'latest', text: 'Message récent', sentAt: '2030-06-11T08:00:00Z' }));
+  store.run('INSERT INTO sessions VALUES(?,?)', 'abcdef', Date.now() + 60000);
+  const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); store.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const headers = { cookie: 'rondivou_session=abcdef' };
+  const data = await (await fetch(base + '/api/dashboard', { headers })).json();
+  assert.equal(data.conversations[0].id, newer.conversation_id);
+  assert.equal(data.conversations[1].started_at, '2030-05-20T08:00:00.000Z');
+  assert.equal(data.conversations[1].last_at, '2030-06-10T08:00:00.000Z');
+  const detail = await (await fetch(base + '/api/conversations/' + older.conversation_id, { headers })).json();
+  assert.equal(detail.started_at, '2030-05-20T08:00:00.000Z');
+  // Keep API chronology intact: UI reverses a copy, while booking source remains the latest message.
+  assert.equal(detail.messages.at(-1).external_id, 'first-live');
+});

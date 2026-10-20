@@ -93,15 +93,16 @@ export function createApp(store, config, request, audit = record => console.info
   app.post('/api/logout', (req, res) => { store.run('DELETE FROM sessions WHERE id=?', sessionId(req)); res.set('Set-Cookie', 'rondivou_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); res.json({ ok: true }); });
   app.get('/api/dashboard', (_req, res) => {
     const conversations = store.all(`SELECT c.*, (SELECT text FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_text,
+      (SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at,
       (SELECT COUNT(*) FROM reviews WHERE conversation_id=c.id AND status='pending') AS review_count,
-      (SELECT sent_at FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_at FROM conversations c ORDER BY last_at DESC`);
+      (SELECT sent_at FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_at FROM conversations c ORDER BY last_at DESC,c.created_at DESC,c.id`);
     res.json({ services: SERVICES, appointments: store.all('SELECT a.*,c.username,c.channel FROM appointments a LEFT JOIN conversations c ON c.id=a.conversation_id ORDER BY start_at'), conversations,
       notifications: store.all('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50'),
       connections: { telegram: Boolean(config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_ADMIN_ID && config.TELEGRAM_WEBHOOK_SECRET), meta: Boolean(config.META_APP_SECRET && config.META_VERIFY_TOKEN && config.META_PAGE_ACCESS_TOKEN && config.META_PAGE_ID && config.META_INSTAGRAM_ID), publicUrl: Boolean(config.PUBLIC_URL?.startsWith('https://')) },
       delivery: store.all('SELECT kind,COUNT(*) AS count FROM outbox WHERE sent_at IS NULL AND error IS NOT NULL GROUP BY kind'), importRunning });
   });
   app.get('/api/conversations/:id', (req, res) => {
-    const c = store.get('SELECT * FROM conversations WHERE id=?', req.params.id);
+    const c = store.get('SELECT c.*,(SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at FROM conversations c WHERE c.id=?', req.params.id);
     if (!c) return res.sendStatus(404);
     const candidate = store.candidate(c.id);
     res.json({ ...c, messages: store.all('SELECT * FROM messages WHERE conversation_id=? ORDER BY sent_at,rowid', c.id), candidate: { ...candidate, ai_pending: aiEnabled(config) && candidate.source !== 'ai' && store.context(c.id).length > 0 }, reviews: store.all("SELECT * FROM reviews WHERE conversation_id=? AND status='pending'", c.id) });
