@@ -4,11 +4,13 @@ import { resolve } from 'node:path';
 import { SERVICES } from './domain.js';
 import { integrations } from './integrations.js';
 import { aiEnabled } from './ai.js';
+import { styleLab, redactStyle } from './style-lab.js';
 
 export function createApp(store, config, request, audit = record => console.info(JSON.stringify(record))) {
   const app = express();
   app.disable('x-powered-by');
   const integration = integrations(store, config, request);
+  const learning = styleLab(store, config, request);
   const passwordHash = scryptSync(config.ADMIN_PASSWORD, 'rondivou-admin', 64);
   const failures = new Map();
   let importRunning = false;
@@ -140,6 +142,37 @@ export function createApp(store, config, request, audit = record => console.info
     res.json({ ok: true });
   });
   app.post('/api/notifications/read', (_req, res) => { store.run('UPDATE notifications SET read_at=? WHERE read_at IS NULL', store.now()); res.json({ ok: true }); });
+  app.get('/api/style', (_req, res) => res.json(learning.report()));
+  app.post('/api/style/learn', (_req, res, next) => { if (importRunning) return res.status(409).json({error:'Attendez la fin de l’import avant d’analyser tous les messages.'}); try { res.status(202).json({ id: learning.start() }); } catch(e) { next(e); } });
+  app.post('/api/style/runs/:id/:action', (req, res) => {
+    if (!['pause','resume'].includes(req.params.action)) return res.sendStatus(404);
+    const run = store.get('SELECT * FROM style_runs WHERE id=?', req.params.id);
+    if (!run) return res.sendStatus(404);
+    const allowed = req.params.action === 'pause' ? ['queued','running'] : ['paused','failed'];
+    if (!allowed.includes(run.status)) return res.status(409).json({ error: 'Cette action ne convient pas à l’état actuel de l’analyse.' });
+    if (req.params.action === 'resume') store.run("UPDATE style_chunks SET status='pending',result=NULL WHERE run_id=? AND status='failed'",run.id);
+    store.run('UPDATE style_runs SET status=?,error=NULL WHERE id=?', req.params.action === 'pause' ? 'paused' : 'queued', run.id);
+    res.json({ ok: true });
+  });
+  app.post('/api/style/chunks/:id/exclude', (req, res) => {
+    if (!store.get('SELECT id FROM style_chunks WHERE id=?',req.params.id)) return res.sendStatus(404);
+    store.run("UPDATE style_chunks SET status='excluded',result=NULL WHERE id=?",req.params.id);
+    res.json({ ok:true });
+  });
+  let testingStyle = false;
+  app.post('/api/style/test', async (req,res,next) => {
+    if (testingStyle) return res.status(409).json({error:'Un test est déjà en cours.'});
+    testingStyle = true;
+    try { res.json(await learning.test(req.body.message)); } catch(e) { next(e); } finally { testingStyle = false; }
+  });
+  app.post('/api/style/tests/:id/feedback', (req,res) => {
+    if (!['approved','rejected','corrected'].includes(req.body.feedback)) return res.status(400).json({error:'Évaluation invalide.'});
+    const correction = req.body.correction || '';
+    if (typeof correction !== 'string' || correction.length > 2000 || (req.body.feedback === 'corrected' && !correction.trim())) return res.status(400).json({error:'Écrivez une correction (2 000 caractères maximum).'});
+    if (!store.get('SELECT id FROM style_tests WHERE id=?',req.params.id)) return res.sendStatus(404);
+    store.run('UPDATE style_tests SET feedback=?,correction=? WHERE id=?',req.body.feedback,redactStyle(correction),req.params.id);
+    res.json({ok:true});
+  });
   app.post('/api/integrations/telegram/connect', async (_req, res, next) => {
     try {
       if (!config.PUBLIC_URL?.startsWith('https://') || !config.TELEGRAM_WEBHOOK_SECRET || !/^\d+$/.test(config.TELEGRAM_ADMIN_ID || '')) throw Object.assign(new Error('Configurez PUBLIC_URL en HTTPS, TELEGRAM_ADMIN_ID et TELEGRAM_WEBHOOK_SECRET.'), { status: 400 });
@@ -160,5 +193,5 @@ export function createApp(store, config, request, audit = record => console.info
   });
   app.use(express.static(resolve(import.meta.dirname, '../public')));
   app.use((err, _req, res, _next) => res.status(err.status || 400).json({ error: err.status || !err.code ? err.message : 'Opération impossible. Vérifiez les données.' }));
-  return { app, integration };
+  return { app, integration, learning };
 }

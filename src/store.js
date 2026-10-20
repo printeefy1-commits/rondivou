@@ -18,6 +18,9 @@ export function createStore(path = '.data/rondivou.sqlite') {
     CREATE TABLE IF NOT EXISTS telegram_updates(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS ai_analyses(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), context_key TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS telegram_cards(conversation_id TEXT NOT NULL REFERENCES conversations(id), chat_id TEXT NOT NULL, message_id TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(conversation_id,chat_id));
+    CREATE TABLE IF NOT EXISTS style_runs(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,message_count INTEGER NOT NULL,chunk_count INTEGER NOT NULL,status TEXT NOT NULL,error TEXT);
+    CREATE TABLE IF NOT EXISTS style_chunks(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES style_runs(id),conversation_id TEXT NOT NULL REFERENCES conversations(id),messages TEXT NOT NULL,created_at TEXT NOT NULL,status TEXT NOT NULL,result TEXT);
+    CREATE TABLE IF NOT EXISTS style_tests(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES style_runs(id),prompt TEXT NOT NULL,reply TEXT NOT NULL,needs_human INTEGER NOT NULL,feedback TEXT NOT NULL,correction TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS appointment_range ON appointments(start_at,end_at);
     CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id,sent_at);
   `);

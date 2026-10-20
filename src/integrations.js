@@ -61,7 +61,12 @@ export function integrations(store, config, request = fetch) {
     const stamp = new Date(sentAt);
     if (!Number.isFinite(stamp.getTime())) throw new Error('Horodatage du message invalide.');
     const inserted = store.run('INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)', id, c.id, String(messageId), text.slice(0, 20000), direction, stamp.toISOString(), Number(historical));
-    if (!inserted.changes) return { duplicate: true };
+    if (!inserted.changes) {
+      // Import membership matters for style learning even if a webhook saved the text first.
+      // Do not replay forwarding, analysis or booking for a duplicate imported message.
+      if (historical) store.run('UPDATE messages SET historical=1 WHERE conversation_id=? AND external_id=?',c.id,String(messageId));
+      return { duplicate: true };
+    }
     const message = store.get('SELECT * FROM messages WHERE id=?', id);
     if (config.META_PAGE_ACCESS_TOKEN && c.username === c.external_id && !store.get("SELECT id FROM outbox WHERE kind='meta_profile' AND sent_at IS NULL AND json_extract(payload,'$.conversationId')=?", c.id)) {
       store.enqueue('meta_profile', { conversationId: c.id });

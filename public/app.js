@@ -26,9 +26,10 @@ async function api(path, options = {}) {
 function showLogin() { $('#shell').hidden = true; $('#login').hidden = false; }
 function switchView(view) {
   currentView = view;
-  for (const key of ['calendar', 'messages', 'settings']) $(`#${key}-view`).hidden = key !== view;
+  for (const key of ['calendar', 'messages', 'settings', 'style']) $(`#${key}-view`).hidden = key !== view;
   $$('[data-view]').forEach(b => b.classList.toggle('active', b.dataset.view === view));
-  $('#breadcrumb').textContent = { calendar: 'Calendrier', messages: 'Conversations', settings: 'Connexions' }[view];
+  if (view === 'style') loadStyle().catch(e => { $('#style-error').textContent = e.message; });
+  $('#breadcrumb').textContent = { calendar: 'Calendrier', messages: 'Conversations', settings: 'Connexions', style: 'Laboratoire IA' }[view];
 }
 async function refresh() {
   state = await api('/dashboard');
@@ -185,5 +186,42 @@ async function openDeepLink() {
 (async () => { try { const session = await api('/session'); if (session.authenticated) { await refresh(); await openDeepLink(); } else showLogin(); } catch (e) { showLogin(); $('#login-error').textContent = e.message; } })();
 setInterval(async () => {
   if ($('#shell').hidden || document.hidden || $('dialog[open]')) return;
-  try { await refresh(); if (currentView === 'messages' && currentConversation) await openConversation(currentConversation); } catch { /* Existing state remains visible; manual refresh provides error details. */ }
+  try { await refresh(); if (currentView === 'messages' && currentConversation) await openConversation(currentConversation); if (currentView === 'style') await loadStyle(); } catch { /* Existing state remains visible; manual refresh provides error details. */ }
 }, 30000);
+
+
+let styleState, styleLatestTest;
+const styleStatus = status => ({ queued: 'En attente', running: 'Analyse en cours', paused: 'En pause', failed: 'À reprendre', completed: 'Analyse terminée' }[status] || status);
+async function loadStyle() {
+  styleState = await api('/style');
+  const run = styleState.run;
+  const done = styleState.chunks.filter(c => ['done','excluded'].includes(c.status)).length;
+  const active = run && ['queued', 'running', 'paused', 'failed'].includes(run.status);
+  $('#style-learn').disabled = !styleState.configured || Boolean(active);
+  $('#style-learn').textContent = run?.status === 'completed' ? 'Analyser à nouveau tous les imports' : 'Analyser les messages importés';
+  $('#style-pause').hidden = !run || !['queued', 'running'].includes(run.status);
+  $('#style-resume').hidden = !run || !['paused', 'failed'].includes(run.status);
+  $('#style-progress').innerHTML = run ? `<div class="style-run"><strong>${escape(styleStatus(run.status))}</strong><span>${run.message_count} messages · ${done} / ${run.chunk_count} lots examinés</span><progress max="${run.chunk_count}" value="${done}"></progress>${run.error ? `<p class="error">${escape(run.error)}</p>` : ''}</div>` : '<p>Aucune analyse lancée.</p>';
+  if (!styleState.configured) $('#style-error').textContent = 'Configurez la connexion IA sur le serveur.';
+  const retained = styleState.chunks.filter(c => c.status === 'done' && c.result?.classification === 'salon');
+  const rules = [...new Set(retained.flatMap(c => c.result.rules))];
+  $('#style-rules').innerHTML = rules.length ? `<h3>Style observé · ${retained.length} lots retenus</h3><ul>${rules.slice(0, 24).map(r => `<li>${escape(r)}</li>`).join('')}</ul>` : '<p>Les observations de style apparaîtront ici après analyse des échanges du salon.</p>';
+  $('#style-source-count').textContent = styleState.chunks.length;
+  const labels = {salon:'Salon',personal:'Personnel / achats',mixed:'Mixte — écarté',uncertain:'Incertain — écarté'};
+  $('#style-sources').innerHTML = styleState.chunks.length ? styleState.chunks.map(c => `<article class="style-source"><div><strong>${escape(c.channel === 'instagram' ? 'IG' : 'FB')}: ${escape(c.username)}</strong><span class="tag">${escape(c.status === 'excluded' ? 'Exclu manuellement' : c.status === 'pending' ? 'En attente' : c.status === 'failed' ? 'À reprendre' : labels[c.result?.classification] || 'À vérifier')}</span>${c.status === 'failed' ? `<p class="error">${escape(c.result?.error || 'Analyse à reprendre.')}</p>` : ''}</div><div class="candidate-actions"><button class="outline small" data-style-open="${c.conversation_id}">Voir l’échange</button>${c.status !== 'excluded' ? `<button class="outline small" data-style-exclude="${c.id}">Exclure ce lot</button>` : ''}</div></article>`).join('') : '<p>Aucune source à examiner.</p>';
+  $$('[data-style-open]').forEach(b => b.onclick = () => { switchView('messages'); openConversation(b.dataset.styleOpen); });
+  $$('[data-style-exclude]').forEach(b => b.onclick = async () => { b.disabled = true; try { await api('/style/chunks/' + b.dataset.styleExclude + '/exclude', { method:'POST', body:'{}' }); await loadStyle(); } catch(e) { $('#style-error').textContent=e.message; } });
+  if (!styleLatestTest && styleState.tests.length) { styleLatestTest = styleState.tests[0]; renderStyleTest(); }
+}
+function renderStyleTest() {
+  const t = styleLatestTest;
+  if (!t) return;
+  $('#style-test-result').innerHTML = `<div class="style-test-answer"><span class="tag">${t.needs_human ? 'Information à compléter par votre équipe' : 'Proposition de test — non envoyée'}</span><p dir="auto">${escape(t.reply)}</p><small>${escape(t.feedback ? ({approved:'Validé',rejected:'À améliorer',corrected:'Correction enregistrée'}[t.feedback]) : 'Ce ton ressemble-t-il à celui du salon ?')}</small><div class="candidate-actions"><button class="outline small" data-style-rating="approved">Oui, bon style</button><button class="outline small" data-style-rating="rejected">À améliorer</button></div><label>Votre version corrigée<textarea id="style-correction" maxlength="2000" rows="3" placeholder="Réécrivez la réponse comme vous le feriez…">${escape(t.correction || '')}</textarea></label><button class="primary" id="style-save-correction">Enregistrer ma correction</button><p class="error" id="style-feedback-error" role="alert"></p></div>`;
+  const save = async (feedback, correction='') => { try { await api('/style/tests/' + t.id + '/feedback',{method:'POST',body:JSON.stringify({feedback,correction})}); t.feedback=feedback; t.correction=correction; renderStyleTest(); toast('Évaluation enregistrée pour les prochains tests.'); } catch(e) { $('#style-feedback-error').textContent=e.message; } };
+  $$('[data-style-rating]').forEach(b => b.onclick=()=>save(b.dataset.styleRating));
+  $('#style-save-correction').onclick=()=>save('corrected',$('#style-correction').value);
+}
+$('#style-learn').onclick=async event=>{ event.target.disabled=true; $('#style-error').textContent=''; try { await api('/style/learn',{method:'POST',body:'{}'}); await loadStyle(); } catch(e) { $('#style-error').textContent=e.message; event.target.disabled=false; } };
+for (const action of ['pause','resume']) $('#style-'+action).onclick=async()=>{ try { await api('/style/runs/'+styleState.run.id+'/'+action,{method:'POST',body:'{}'}); await loadStyle(); } catch(e) { $('#style-error').textContent=e.message; } };
+$('#style-refresh').onclick=()=>loadStyle().catch(e=>{$('#style-error').textContent=e.message;});
+$('#style-test-form').onsubmit=async event=>{event.preventDefault();const b=$('#style-test-submit');b.disabled=true;b.textContent='Réponse en cours…';$('#style-test-error').textContent='';try{styleLatestTest=await api('/style/test',{method:'POST',body:JSON.stringify({message:$('#style-test-message').value})});renderStyleTest();}catch(e){$('#style-test-error').textContent=e.message;}finally{b.disabled=false;b.textContent='Essayer une réponse ✦';}};
