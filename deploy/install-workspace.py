@@ -11,9 +11,10 @@ import tempfile
 import urllib.request
 
 BASELINES = {
+    'src/server.js': {'e7481965c2f18d934e812ed8bebf7e5f229263d227748610d3116e598bfadcfb'},
     'src/app.js': {'3d1293ac6808df0c12b9fb07d8bad94cb5ea80989479ab1c1755f8d16b1ecc36', '0a3f92c91a7487def49618f654e704fcb667858850eb068ebfe479a6b6583688'},
-    'src/store.js': {'978fd39b90ba54013f41d5033d47a2abe4a4a490d65c1476fcfc2da92b971469'},
-    'src/integrations.js': {'2b1f3e2ddc0100b4ff9e82837a9180482dcff0a280d832d5838ab99f7ef04f82'},
+    'src/store.js': {'62209e3ee512ec065b045784e7ec1a442cd093d1c092a7868feec69905eeba32', '978fd39b90ba54013f41d5033d47a2abe4a4a490d65c1476fcfc2da92b971469'},
+    'src/integrations.js': {'f4525461640d0b033ad3b56656ccd94e3ab76277acc5d49b23e325a49be39280', '2b1f3e2ddc0100b4ff9e82837a9180482dcff0a280d832d5838ab99f7ef04f82'},
     'src/telegram-cards.js': set(),
     'public/app.js': {'3e90fd92aca52367c19279f3c58f6d4cd154543ebae1c2643d07e681c689f0b9', '214eed8c3d7d3c0a23369eddc4fa6673e0fa72eb0097ce872dc740b40bff1734', '33906c0f7d62fbb07d8a4307ce8e5abb035bedcba34ae9297795b4392240836a'},
     'public/style.css': {'b4c78aed5e2e77211b42ffc65f6904d3ce360c5e370c3fedc868f326ab60b62a'},
@@ -100,7 +101,9 @@ def main():
                     write_source(root / relative, original)
             connector.docker('restart', 'rondivou')
             raise
-    print('Readable workspace installed. Application health passed.')
+    print('Workspace and Meta profile recovery installed. Application health passed.')
+    print('Unresolved account names are queued for recovery before slow AI work; empty profiles retry instead of being marked complete.')
+    print('Meta may still deny profile access for some accounts. No username is guessed or invented.')
     print('Conversations show the earliest available message date and latest messages at the bottom; most recently active conversations first.')
     print('Larger text, higher contrast and mobile layouts enabled. Calendar keeps FB:/IG: account labels.')
     print('New messages, profile names and AI results update ONE card per conversation, grouped over about 8 seconds.')

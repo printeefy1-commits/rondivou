@@ -12,6 +12,14 @@ import urllib.parse
 import urllib.request
 
 
+def summarize_profile_error(error):
+    # Application messages can be arbitrary in older versions. Never echo them.
+    match = re.search(r'\((\d{3}), code (\d+)\)', error or '')
+    if match:
+        return {'http_status': int(match[1]), 'meta_code': int(match[2])}
+    return {'reason': 'name_not_returned' if (error or '').startswith('Meta ne fournit pas encore de nom') else 'request_failed'}
+
+
 def graph(base, path, bearer, payload=None):
     headers = {'Authorization': 'Bearer ' + bearer}
     if payload is not None:
@@ -186,6 +194,8 @@ def main():
         connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)
         try:
             report['stored_counts'] = {table: connection.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0] for table in ['conversations', 'messages']}
+            report['unresolved_profile_counts'] = [{'channel': channel, 'count': count} for channel, count in connection.execute('SELECT channel,COUNT(*) FROM conversations WHERE username=external_id GROUP BY channel')]
+            report['profile_lookup_errors'] = [{**summarize_profile_error(error), 'count': count} for error, count in connection.execute("SELECT error,COUNT(*) FROM outbox WHERE kind='meta_profile' AND sent_at IS NULL AND error IS NOT NULL GROUP BY error")]
             report['outgoing_pending'] = [{'kind': kind, 'count': count, 'failed_count': failed} for kind, count, failed in connection.execute('SELECT kind,COUNT(*),SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END) FROM outbox WHERE sent_at IS NULL GROUP BY kind')]
         finally:
             connection.close()

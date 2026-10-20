@@ -39,6 +39,21 @@ export function integrations(store, config, request = fetch) {
     if (!aiEnabled(config) || !store.context(conversationId).length) return;
     if (!store.get("SELECT id FROM outbox WHERE kind='ai_extract' AND sent_at IS NULL AND json_extract(payload,'$.conversationId')=?", conversationId)) store.enqueue('ai_extract', { conversationId });
   }
+  function queueMissingProfiles({ retryFailed = false } = {}) {
+    if (!config.META_PAGE_ACCESS_TOKEN) return 0;
+    let count = 0;
+    for (const c of store.all('SELECT id FROM conversations WHERE username=external_id')) {
+      const pending = store.get("SELECT id,error FROM outbox WHERE kind='meta_profile' AND sent_at IS NULL AND json_extract(payload,'$.conversationId')=?", c.id);
+      if (!pending) {
+        store.enqueue('meta_profile', { conversationId: c.id });
+        count++;
+      } else if (retryFailed && pending.error) {
+        store.run('UPDATE outbox SET next_at=?,error=NULL WHERE id=?', store.now(), pending.id);
+        count++;
+      }
+    }
+    return count;
+  }
   function ingest({ channel, externalId, username, messageId, text, direction, sentAt, historical = false }) {
     if (!text?.trim()) return { ignored: true };
     const c = store.conversation(channel, externalId, username);
@@ -48,7 +63,7 @@ export function integrations(store, config, request = fetch) {
     const inserted = store.run('INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)', id, c.id, String(messageId), text.slice(0, 20000), direction, stamp.toISOString(), Number(historical));
     if (!inserted.changes) return { duplicate: true };
     const message = store.get('SELECT * FROM messages WHERE id=?', id);
-    if (config.META_PAGE_ACCESS_TOKEN && c.username === c.external_id && !store.get("SELECT id FROM outbox WHERE kind='meta_profile' AND json_extract(payload,'$.conversationId')=?", c.id)) {
+    if (config.META_PAGE_ACCESS_TOKEN && c.username === c.external_id && !store.get("SELECT id FROM outbox WHERE kind='meta_profile' AND sent_at IS NULL AND json_extract(payload,'$.conversationId')=?", c.id)) {
       store.enqueue('meta_profile', { conversationId: c.id });
     }
     // Every text is forwarded, including the manager's replies, without Telegram HTML parsing.
@@ -179,7 +194,8 @@ export function integrations(store, config, request = fetch) {
     if (working) return;
     working = true;
     try {
-      const jobs = store.all('SELECT * FROM outbox WHERE sent_at IS NULL AND next_at<=? ORDER BY rowid LIMIT 1', store.now());
+      // Resolve identities before slow historical AI work; retries still respect next_at.
+      const jobs = store.all("SELECT * FROM outbox WHERE sent_at IS NULL AND next_at<=? ORDER BY CASE WHEN kind='meta_profile' THEN 0 WHEN kind IN ('telegram','telegram_card') THEN 1 ELSE 2 END,rowid LIMIT 1", store.now());
       for (const job of jobs) {
         try {
           const payload = JSON.parse(job.payload);
@@ -188,13 +204,16 @@ export function integrations(store, config, request = fetch) {
           else if (job.kind === 'ai_extract') await analyzeConversation(payload.conversationId);
           else if (job.kind === 'meta_profile') {
             const c = store.get('SELECT * FROM conversations WHERE id=?', payload.conversationId);
-            if (c) {
+            if (c && c.username === c.external_id) {
               const profile = await graph(c.external_id, { fields: c.channel === 'instagram' ? 'name,username' : 'first_name,last_name' });
               const name = profile.username || profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' ');
+              if (!name?.trim() || name === c.external_id) throw new Error('Meta ne fournit pas encore de nom pour ce compte. Nouvelle tentative programmée.');
               if (name) {
-                store.run('UPDATE conversations SET username=? WHERE id=?', name, c.id);
-                if (cards.enabled) cards.queue(c.id);
-                else store.enqueue('telegram', { text: `👤 ${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${name}\nProfil identifié pour la conversation ${c.external_id}.`, reply_markup: buttons(c.id) });
+                const updated = store.run('UPDATE conversations SET username=? WHERE id=? AND username=external_id', name, c.id);
+                if (updated.changes) {
+                  if (cards.enabled) cards.queue(c.id);
+                  else store.enqueue('telegram', { text: `👤 ${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${name}\nProfil identifié pour la conversation ${c.external_id}.`, reply_markup: buttons(c.id) });
+                }
               }
             }
           }
@@ -265,5 +284,5 @@ export function integrations(store, config, request = fetch) {
     store.notify('import', `${imported} messages importés. Validation manuelle obligatoire avant tout ajout.`);
     return imported;
   }
-  return { ingest, metaEvents, telegramEvent, telegram, graph, flush, scheduleReminders, importHistory, queueAnalysis, refreshCard: cards.queue };
+  return { ingest, metaEvents, telegramEvent, telegram, graph, flush, scheduleReminders, importHistory, queueAnalysis, queueMissingProfiles, refreshCard: cards.queue };
 }

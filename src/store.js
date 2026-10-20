@@ -29,7 +29,14 @@ export function createStore(path = '.data/rondivou.sqlite') {
   function enqueue(kind, payload) { run('INSERT INTO outbox(id,kind,payload,next_at) VALUES(?,?,?,?)', randomUUID(), kind, JSON.stringify(payload), now()); }
   function conversation(channel, externalId, username) {
     const existing = get('SELECT * FROM conversations WHERE channel=? AND external_id=?', channel, externalId);
-    if (existing) return existing;
+    if (existing) {
+      // An imported participant can supply the name missing from an earlier webhook.
+      if (existing.username === existing.external_id && username && username !== externalId) {
+        run('UPDATE conversations SET username=? WHERE id=?', username, existing.id);
+        return get('SELECT * FROM conversations WHERE id=?', existing.id);
+      }
+      return existing;
+    }
     const id = randomUUID();
     run('INSERT INTO conversations VALUES(?,?,?,?,?)', id, channel, externalId, username || externalId, now());
     return get('SELECT * FROM conversations WHERE id=?', id);

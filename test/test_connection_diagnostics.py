@@ -12,6 +12,11 @@ spec.loader.exec_module(diagnostics)
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_profile_failures_are_classified_without_printing_raw_messages(self):
+        self.assertEqual(diagnostics.summarize_profile_error('Échec du service distant (400, code 100).'), {'http_status': 400, 'meta_code': 100})
+        self.assertEqual(diagnostics.summarize_profile_error('Meta ne fournit pas encore de nom pour ce compte.'), {'reason': 'name_not_returned'})
+        self.assertEqual(diagnostics.summarize_profile_error('secret-token customer-name 123456'), {'reason': 'request_failed'})
+
     def settings(self):
         return {'PUBLIC_URL': 'https://example.test', 'META_APP_ID': '123', 'META_APP_SECRET': 'fixture-app-secret', 'META_VERIFY_TOKEN': 'fixture-verify-secret', 'META_INSTAGRAM_ID': '789', 'META_PAGE_ID': '456', 'META_PAGE_ACCESS_TOKEN': 'fixture-page-token'}
 

@@ -17,6 +17,7 @@ if (!config.ADMIN_PASSWORD) {
 }
 const store = createStore(config.DATABASE_PATH || '.data/rondivou.sqlite');
 const { app, integration } = createApp(store, config);
+integration.queueMissingProfiles({ retryFailed: true });
 const server = app.listen(Number(config.PORT || 3000), config.HOST || '127.0.0.1', () => console.log('Rondivou démarré · fuseau Africa/Algiers · port ' + (config.PORT || 3000)));
 const timer = setInterval(() => { integration.scheduleReminders(); integration.flush().catch(() => store.notify('warning', 'Erreur du traitement des notifications.')); }, 1000);
 timer.unref();
