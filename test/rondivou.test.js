@@ -177,3 +177,25 @@ test('HTTP auth, booking persistence/conflict, origin check, webhook signatures'
   const signature = 'sha256=' + createHmac('sha256', 'app-secret').update(event).digest('hex');
   assert.equal((await fetch(base + '/webhooks/meta', { method: 'POST', headers: { ...headers, 'x-hub-signature-256': signature }, body: event })).status, 200);
 });
+
+test('Meta webhook audit distinguishes rejected and accepted requests without exposing messages or secrets', async t => {
+  const store = createStore(':memory:');
+  const records = [];
+  const { app } = createApp(store, { ADMIN_PASSWORD: 'fixture-admin', META_APP_SECRET: 'fixture-app-secret' }, undefined, record => records.push(record));
+  const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+  t.after(async () => { await new Promise(resolve => server.close(resolve)); store.close(); });
+  const url = `http://127.0.0.1:${server.address().port}/webhooks/meta`;
+  const text = JSON.stringify({ object: 'page', entry: [{ id: 'private-page-id', messaging: [{ sender: { id: 'private-sender-id' }, recipient: { id: 'private-page-id' }, timestamp: Date.now(), message: { mid: 'private-message-id', text: 'PRIVATE_CLIENT_MESSAGE' } }], changes: [{ field: 'PRIVATE_FIELD_NAME', value: 'PRIVATE_VALUE' }] }] });
+  const headers = { 'Content-Type': 'application/json' };
+  assert.equal((await fetch(url, { method: 'POST', headers: { ...headers, 'x-hub-signature-256': 'sha256=' + '0'.repeat(64) }, body: text })).status, 403);
+  const signature = 'sha256=' + createHmac('sha256', 'fixture-app-secret').update(text).digest('hex');
+  assert.equal((await fetch(url, { method: 'POST', headers: { ...headers, 'x-hub-signature-256': signature }, body: text })).status, 200);
+  assert.equal(records.length, 2);
+  assert.equal(records[0].reason, 'invalid_signature');
+  assert.equal(records[1].reason, 'accepted');
+  assert.equal(records[1].text_events, 1);
+  assert.equal(records[1].messaging_events, 1);
+  assert.deepEqual(records[1].changes_fields, ['other']);
+  assert.equal(store.get('SELECT COUNT(*) AS n FROM messages').n, 1);
+  for (const secret of ['PRIVATE', 'private-sender', 'private-page', 'fixture-app-secret', signature]) assert.ok(!JSON.stringify(records).includes(secret));
+});

@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { SERVICES } from './domain.js';
 import { integrations } from './integrations.js';
 
-export function createApp(store, config, request) {
+export function createApp(store, config, request, audit = record => console.info(JSON.stringify(record))) {
   const app = express();
   app.disable('x-powered-by');
   const integration = integrations(store, config, request);
@@ -20,14 +20,33 @@ export function createApp(store, config, request) {
     if (config.META_VERIFY_TOKEN && req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === config.META_VERIFY_TOKEN) return res.type('text').send(req.query['hub.challenge']);
     res.sendStatus(403);
   });
-  app.post('/webhooks/meta', express.raw({ type: 'application/json', limit: '1mb' }), (req, res) => {
-    if (!config.META_APP_SECRET) return res.sendStatus(503);
-    if (!Buffer.isBuffer(req.body)) return res.sendStatus(400);
+  app.post('/webhooks/meta', (req, res, next) => {
+    // Structural counts only: no body, URL query, identity, signature or token is logged.
+    res.locals.metaAudit = { event: 'meta_webhook', reason: 'not_processed' };
+    res.on('finish', () => {
+      try { audit({ ...res.locals.metaAudit, status: res.statusCode, at: new Date().toISOString() }); } catch { /* Logging must not interrupt delivery. */ }
+    });
+    next();
+  }, express.raw({ type: 'application/json', limit: '1mb' }), (req, res) => {
+    const info = res.locals.metaAudit;
+    if (!config.META_APP_SECRET) { info.reason = 'secret_not_configured'; return res.sendStatus(503); }
+    if (!Buffer.isBuffer(req.body)) { info.reason = 'unsupported_content_type'; return res.sendStatus(400); }
     const signature = req.get('x-hub-signature-256') || '';
     const expected = 'sha256=' + createHmac('sha256', config.META_APP_SECRET).update(req.body || '').digest('hex');
-    if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return res.sendStatus(403);
-    try { integration.metaEvents(JSON.parse(req.body.toString())); res.sendStatus(200); }
-    catch { res.status(400).json({ error: 'Événement invalide.' }); }
+    if (!/^sha256=[a-f0-9]{64}$/.test(signature) || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) { info.reason = 'invalid_signature'; return res.sendStatus(403); }
+    let body;
+    try { body = JSON.parse(req.body.toString()); }
+    catch { info.reason = 'invalid_json'; return res.sendStatus(400); }
+    const entries = Array.isArray(body?.entry) ? body.entry : [];
+    const events = entries.flatMap(entry => Array.isArray(entry?.messaging) ? entry.messaging : []);
+    const changes = entries.flatMap(entry => Array.isArray(entry?.changes) ? entry.changes : []);
+    const known = new Set(['messages', 'message_echoes', 'messaging_postbacks', 'messaging_seen', 'messaging_reactions', 'feed', 'comments']);
+    Object.assign(info, { object: ['page', 'instagram'].includes(body?.object) ? body.object : 'other', entries: entries.length,
+      messaging_events: events.length, text_events: events.filter(event => typeof event?.message?.text === 'string').length,
+      echo_events: events.filter(event => event?.message?.is_echo === true).length,
+      changes_fields: [...new Set(changes.map(change => known.has(change?.field) ? change.field : 'other'))] });
+    try { integration.metaEvents(body); info.reason = 'accepted'; res.sendStatus(200); }
+    catch { info.reason = 'event_processing_failed'; res.status(400).json({ error: 'Événement invalide.' }); }
   });
   app.post('/webhooks/telegram', express.json({ limit: '1mb' }), async (req, res) => {
     const expected = config.TELEGRAM_WEBHOOK_SECRET || '';
