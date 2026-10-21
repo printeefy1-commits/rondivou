@@ -22,6 +22,9 @@ export function createStore(path = '.data/rondivou.sqlite') {
     CREATE INDEX IF NOT EXISTS appointment_range ON appointments(start_at,end_at);
     CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id,sent_at);
   `);
+  // Keep account metadata for existing bookings and a cutoff against replayed imports.
+  const conversationColumns = new Set(db.prepare('PRAGMA table_info(conversations)').all().map(c => c.name));
+  for (const column of ['deleted_at','cleared_at']) if (!conversationColumns.has(column)) db.exec(`ALTER TABLE conversations ADD COLUMN ${column} TEXT`);
   const all = (q, ...args) => db.prepare(q).all(...args);
   const get = (q, ...args) => db.prepare(q).get(...args);
   const run = (q, ...args) => db.prepare(q).run(...args);
@@ -39,8 +42,28 @@ export function createStore(path = '.data/rondivou.sqlite') {
       return existing;
     }
     const id = randomUUID();
-    run('INSERT INTO conversations VALUES(?,?,?,?,?)', id, channel, externalId, username || externalId, now());
+    run('INSERT INTO conversations(id,channel,external_id,username,created_at) VALUES(?,?,?,?,?)', id, channel, externalId, username || externalId, now());
     return get('SELECT * FROM conversations WHERE id=?', id);
+  }
+  function deleteConversation(id) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!get('SELECT id FROM conversations WHERE id=? AND deleted_at IS NULL',id)) throw Object.assign(new Error('Conversation introuvable.'),{status:404});
+      const stamp=now();
+      run('UPDATE conversations SET deleted_at=?,cleared_at=? WHERE id=?',stamp,stamp,id);
+      // Retain booking details and account labels while removing message references.
+      run('UPDATE appointments SET source_message_id=NULL WHERE conversation_id=?',id);
+      run('DELETE FROM reviews WHERE conversation_id=?',id);
+      run('DELETE FROM ai_analyses WHERE conversation_id=?',id);
+      run('DELETE FROM telegram_cards WHERE conversation_id=?',id);
+      if (get("SELECT name FROM sqlite_master WHERE type='table' AND name='style_chunks'")) run('DELETE FROM style_chunks WHERE conversation_id=?',id);
+      for (const job of all('SELECT id,payload FROM outbox')) {
+        const payload=JSON.parse(job.payload);
+        if (payload.conversationId === id || payload.reply_markup?.inline_keyboard?.flat().some(b => b.callback_data === `plan:${id}` || b.callback_data === `confirm:${id}`)) run('DELETE FROM outbox WHERE id=?',job.id);
+      }
+      run('DELETE FROM messages WHERE conversation_id=?',id);
+      db.exec('COMMIT');
+    } catch(e) { db.exec('ROLLBACK'); throw e; }
   }
   function context(id) {
     const last = get("SELECT m.sent_at FROM appointments a JOIN messages m ON m.id=a.source_message_id WHERE a.conversation_id=? ORDER BY m.sent_at DESC LIMIT 1", id);
@@ -75,5 +98,5 @@ export function createStore(path = '.data/rondivou.sqlite') {
     if (analysis && analysis.context_key === contextKey(messages)) return JSON.parse(analysis.result);
     return extract(messages);
   }
-  return { db, all, get, run, now, notify, enqueue, conversation, context, book, candidate, close: () => db.close() };
+  return { db, all, get, run, now, notify, enqueue, conversation, deleteConversation, context, book, candidate, close: () => db.close() };
 }

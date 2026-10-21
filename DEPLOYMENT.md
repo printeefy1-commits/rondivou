@@ -147,3 +147,9 @@ En cas d'oubli, utiliser la version actuelle de `deploy/reset-admin-password.py`
 ## Recherche dans les conversations
 
 Le champ de recherche filtre les comptes et tous les textes enregistrés (messages entrants, sortants et historique importé). La recherche ignore la casse et les accents ; les caractères `%` et `_` sont littéraux. Les résultats restent triés par dernier échange, avec un aperçu du message correspondant le plus récent. Un clic ouvre la conversation et positionne la lecture sur ce message, mis en évidence. Effacer la recherche rétablit la liste complète. L'API exige la même session administrateur que les conversations ; aucun texte n'est envoyé au fournisseur IA pour cette recherche.
+
+## Supprimer une conversation
+
+Le bouton « Supprimer la conversation » dans l’échange demande confirmation. L’API administrateur supprime les messages locaux, les vérifications, les analyses IA, le suivi des cartes Telegram et les tâches de conversation, dans une transaction. Les anciens instantanés de style liés à cet échange sont aussi supprimés si ces tables existent. Les rendez-vous, leurs coordonnées, leur statut et les rappels restent conservés ; seuls leurs liens vers les messages sources supprimés sont retirés. Le compte et ses identifiants Meta restent en base pour conserver les libellés du calendrier et permettre les rappels existants. Une borne de suppression empêche les anciennes livraisons et les imports de remettre les messages effacés dans le site.
+
+La conversation disparaît des listes, de la recherche et des accès directs. Un nouveau message en direct, postérieur à la suppression, réaffiche le compte avec uniquement les nouveaux échanges. Cela ne supprime rien dans Facebook, Instagram, les messages Telegram déjà reçus ou les sauvegardes existantes. Un appel externe déjà en cours peut se terminer ; son résultat IA n’est plus enregistré pour cet historique supprimé.

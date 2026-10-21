@@ -5,7 +5,7 @@ export function telegramCards(store, config, telegram, buttons) {
   const enabled = config.TELEGRAM_COMPACT === 'true';
   const clip = (text, limit) => { const chars = Array.from(text); return chars.length > limit ? chars.slice(0, limit).join('') + '…' : text; };
   function queue(conversationId) {
-    if (!enabled) return;
+    if (!enabled || !store.get('SELECT id FROM conversations WHERE id=? AND deleted_at IS NULL',conversationId)) return;
     if (!store.get("SELECT id FROM outbox WHERE kind='telegram_card' AND sent_at IS NULL AND json_extract(payload,'$.conversationId')=?", conversationId)) {
       store.enqueue('telegram_card', { conversationId });
       // Wait briefly for profile lookup and nearby messages; never postpone indefinitely.
@@ -14,7 +14,7 @@ export function telegramCards(store, config, telegram, buttons) {
   }
   function render(conversationId) {
     const c = store.get('SELECT * FROM conversations WHERE id=?', conversationId);
-    if (!c) return null;
+    if (!c || c.deleted_at) return null;
     const messages = store.all('SELECT * FROM (SELECT rowid AS sequence,* FROM messages WHERE conversation_id=? ORDER BY sent_at DESC,rowid DESC LIMIT 3) ORDER BY sent_at,sequence', c.id);
     const candidate = store.candidate(c.id);
     const context = store.context(c.id);
@@ -60,6 +60,7 @@ export function telegramCards(store, config, telegram, buttons) {
       if (!Number.isSafeInteger(sent?.message_id)) throw new Error('Identifiant de carte Telegram absent.');
       messageId = String(sent.message_id);
     }
+    if (!store.get('SELECT id FROM conversations WHERE id=? AND deleted_at IS NULL',conversationId)) return;
     store.run('INSERT INTO telegram_cards VALUES(?,?,?,?,?) ON CONFLICT(conversation_id,chat_id) DO UPDATE SET message_id=excluded.message_id,content=excluded.content,updated_at=excluded.updated_at', conversationId, String(config.TELEGRAM_ADMIN_ID), String(messageId), content, store.now());
     // If new data arrived during the API request, schedule exactly one follow-up.
     if (JSON.stringify(render(conversationId)) !== content) store.enqueue('telegram_card', { conversationId });

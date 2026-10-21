@@ -1,0 +1,84 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { createStore } from '../src/store.js';
+import { createApp } from '../src/app.js';
+import { integrations } from '../src/integrations.js';
+import { telegramCards } from '../src/telegram-cards.js';
+
+const message = extra => ({channel:'instagram',externalId:'fixture-client',username:'client_ig',messageId:'old',text:'Bonjour pour un rendez-vous',direction:'in',sentAt:new Date(Date.now()-60000).toISOString(),...extra});
+
+test('delete removes local history and jobs, preserves appointments and only new live messages reopen the account',async t=>{
+  const store=createStore(':memory:');
+  const {app,integration}=createApp(store,{ADMIN_PASSWORD:'fixture-delete-password'});
+  const server=app.listen(0,'127.0.0.1');await new Promise(r=>server.once('listening',r));
+  t.after(async()=>{await new Promise(r=>server.close(r));store.close();});
+  const base='http://127.0.0.1:'+server.address().port;
+  const first=integration.ingest(message());const id=first.conversation_id;
+  const other=integration.ingest(message({externalId:'other',messageId:'other',username:'keep_account'}));
+  const booking=store.book({conversation_id:id,source_message_id:first.message_id,date:'2030-10-23',time:'10:00',service:'coiffure',phone:'0555123456'});
+  store.run('INSERT INTO ai_analyses VALUES(?,?,?,?)',id,'fixture','{}',store.now());
+  store.run('INSERT INTO telegram_cards VALUES(?,?,?,?,?)',id,'1','2','fixture',store.now());
+  for(const kind of ['ai_extract','meta_profile','telegram_card'])store.enqueue(kind,{conversationId:id});
+  store.enqueue('meta_reminder',{appointmentId:booking.id,startAt:booking.start_at});
+  store.db.exec('CREATE TABLE style_chunks(id TEXT,conversation_id TEXT REFERENCES conversations(id),messages TEXT)');
+  store.run('INSERT INTO style_chunks VALUES(?,?,?)','fixture',id,'old style snapshot');
+  const endpoint=base+'/api/conversations/'+id;
+  assert.equal((await fetch(endpoint,{method:'DELETE'})).status,401);
+  const login=await fetch(base+'/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:'fixture-delete-password'})});
+  const headers={cookie:login.headers.get('set-cookie').split(';')[0]};
+  assert.equal((await fetch(endpoint,{method:'DELETE',headers:{...headers,origin:'https://outside.test'}})).status,403);
+  assert.equal((await fetch(endpoint,{method:'DELETE',headers})).status,200);
+  assert.equal((await fetch(endpoint,{headers})).status,404);
+  assert.equal((await fetch(endpoint,{method:'DELETE',headers})).status,404);
+  for(const table of ['messages','reviews','ai_analyses','telegram_cards','style_chunks'])assert.equal(store.get(`SELECT COUNT(*) AS n FROM ${table} WHERE conversation_id=?`,id).n,0,table);
+  assert.equal(store.get("SELECT COUNT(*) AS n FROM outbox WHERE json_extract(payload,'$.conversationId')=?",id).n,0);
+  assert.ok(store.get("SELECT id FROM outbox WHERE kind='meta_reminder' AND json_extract(payload,'$.appointmentId')=?",booking.id));
+  assert.equal(store.get('SELECT source_message_id FROM appointments WHERE id=?',booking.id).source_message_id,null);
+  let dashboard=await(await fetch(base+'/api/dashboard',{headers})).json();
+  assert.deepEqual(dashboard.conversations.map(c=>c.id),[other.conversation_id]);
+  assert.equal(dashboard.appointments[0].username,'client_ig');assert.equal(dashboard.appointments[0].phone,'0555123456');
+  assert.equal((await(await fetch(base+'/api/conversations/search?q=client_ig',{headers})).json()).conversations.length,0);
+  assert.equal((await fetch(base+'/api/appointments/'+booking.id,{method:'PUT',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({conversation_id:id,date:'2030-10-23',time:'11:00',service:'coiffure',phone:'0555123456'})})).status,200);
+  assert.equal(integration.ingest(message({historical:true})).ignored,true);
+  assert.equal(integration.ingest(message()).ignored,true);
+  const newText={messageId:'new',text:'Un nouveau message',sentAt:new Date(Date.now()+1000).toISOString()};
+  assert.equal(integration.ingest(message({...newText,historical:true})).ignored,true);
+  assert.ok(integration.ingest(message(newText)).message_id);
+  assert.equal(integration.ingest(message({historical:true})).ignored,true);
+  assert.equal(store.all('SELECT * FROM messages WHERE conversation_id=?',id).length,1);
+  dashboard=await(await fetch(base+'/api/dashboard',{headers})).json();assert.equal(dashboard.conversations.length,2);
+});
+
+test('deletion migration and replay cutoff persist after reopening; failures roll back all deletions',t=>{
+  const directory=mkdtempSync(join(tmpdir(),'rondivou-delete-'));const file=join(directory,'app.sqlite');
+  const old=new DatabaseSync(file);old.exec('CREATE TABLE conversations(id TEXT PRIMARY KEY,channel TEXT NOT NULL,external_id TEXT NOT NULL,username TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(channel,external_id))');old.close();
+  let store=createStore(file);t.after(()=>{store.close();rmSync(directory,{recursive:true,force:true});});
+  const integration=integrations(store,{});const first=integration.ingest(message());
+  store.db.exec("CREATE TRIGGER prevent_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT,'fixture failure'); END");
+  assert.throws(()=>store.deleteConversation(first.conversation_id),/fixture failure/);
+  assert.equal(store.get('SELECT deleted_at FROM conversations').deleted_at,null);assert.equal(store.all('SELECT * FROM messages').length,1);
+  store.db.exec('DROP TRIGGER prevent_delete');store.deleteConversation(first.conversation_id);
+  store.close();store=createStore(file);
+  assert.ok(store.get('SELECT cleared_at FROM conversations').cleared_at);
+  assert.equal(integrations(store,{}).ingest(message({historical:true})).ignored,true);
+  const cards=telegramCards(store,{TELEGRAM_COMPACT:'true'},()=>{throw new Error('No sending');},()=>({inline_keyboard:[]}));
+  cards.queue(first.conversation_id);assert.equal(cards.render(first.conversation_id),null);
+  assert.equal(store.get("SELECT COUNT(*) AS n FROM outbox WHERE kind='telegram_card'").n,0);
+});
+
+test('an AI request already in flight cannot recreate deleted history or appointments',async t=>{
+  const store=createStore(':memory:');t.after(()=>store.close());
+  let release,started;
+  const ready=new Promise(r=>{started=r;});
+  const pending=new Promise(r=>{release=r;});
+  const request=async()=>{started();await pending;return new Response(JSON.stringify({choices:[{finish_reason:'stop',message:{content:JSON.stringify({date:'',time:'',service:'',client_name:'',phone:'',ambiguous:true,agreement:false,change_requested:false,evidence:{}})}}]}));};
+  const integration=integrations(store,{AI_BASE_URL:'https://fixture.test/v1',AI_API_KEY:'fixture',TELEGRAM_COMPACT:'true'},request);
+  const first=integration.ingest(message());
+  const flush=integration.flush();await ready;store.deleteConversation(first.conversation_id);release();await flush;
+  assert.equal(store.all('SELECT * FROM ai_analyses').length,0);assert.equal(store.all('SELECT * FROM appointments').length,0);
+  assert.equal(store.all('SELECT * FROM outbox').length,0);
+});

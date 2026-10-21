@@ -121,8 +121,8 @@ export function createApp(store, config, request, audit = record => console.info
       (SELECT sent_at FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_at,
       (SELECT text FROM messages WHERE conversation_id=c.id AND search_contains(text,?) ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS match_text,
       (SELECT id FROM messages WHERE conversation_id=c.id AND search_contains(text,?) ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS match_message_id
-      FROM conversations c WHERE search_contains(c.username,?) OR EXISTS
-        (SELECT 1 FROM messages WHERE conversation_id=c.id AND search_contains(text,?))
+      FROM conversations c WHERE c.deleted_at IS NULL AND (search_contains(c.username,?) OR EXISTS
+        (SELECT 1 FROM messages WHERE conversation_id=c.id AND search_contains(text,?)))
       ORDER BY last_at DESC,c.created_at DESC,c.id`,query,query,query,query);
     res.json({conversations});
   });
@@ -130,21 +130,24 @@ export function createApp(store, config, request, audit = record => console.info
     const conversations = store.all(`SELECT c.*, (SELECT text FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_text,
       (SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at,
       (SELECT COUNT(*) FROM reviews WHERE conversation_id=c.id AND status='pending') AS review_count,
-      (SELECT sent_at FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_at FROM conversations c ORDER BY last_at DESC,c.created_at DESC,c.id`);
+      (SELECT sent_at FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_at FROM conversations c WHERE c.deleted_at IS NULL ORDER BY last_at DESC,c.created_at DESC,c.id`);
     res.json({ services: SERVICES, appointments: store.all('SELECT a.*,c.username,c.channel FROM appointments a LEFT JOIN conversations c ON c.id=a.conversation_id ORDER BY start_at'), conversations,
       notifications: store.all('SELECT * FROM notifications ORDER BY created_at DESC LIMIT 50'),
       connections: { telegram: Boolean(config.TELEGRAM_BOT_TOKEN && config.TELEGRAM_ADMIN_ID && config.TELEGRAM_WEBHOOK_SECRET), meta: Boolean(config.META_APP_SECRET && config.META_VERIFY_TOKEN && config.META_PAGE_ACCESS_TOKEN && config.META_PAGE_ID && config.META_INSTAGRAM_ID), publicUrl: Boolean(config.PUBLIC_URL?.startsWith('https://')) },
       delivery: store.all('SELECT kind,COUNT(*) AS count FROM outbox WHERE sent_at IS NULL AND error IS NOT NULL GROUP BY kind'), importRunning });
   });
   app.get('/api/conversations/:id', (req, res) => {
-    const c = store.get('SELECT c.*,(SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at FROM conversations c WHERE c.id=?', req.params.id);
+    const c = store.get('SELECT c.*,(SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at FROM conversations c WHERE c.id=? AND c.deleted_at IS NULL', req.params.id);
     if (!c) return res.sendStatus(404);
     const candidate = store.candidate(c.id);
     res.json({ ...c, messages: store.all('SELECT * FROM messages WHERE conversation_id=? ORDER BY sent_at,rowid', c.id), candidate: { ...candidate, ai_pending: aiEnabled(config) && candidate.source !== 'ai' && store.context(c.id).length > 0 }, reviews: store.all("SELECT * FROM reviews WHERE conversation_id=? AND status='pending'", c.id) });
   });
+  app.delete('/api/conversations/:id', (req,res,next) => {
+    try { store.deleteConversation(req.params.id); res.json({ok:true}); } catch(e) { next(e); }
+  });
   app.post('/api/conversations/:id/analyze', (req, res) => {
     if (!aiEnabled(config)) return res.status(409).json({ error: 'Configurez la connexion IA sur le serveur.' });
-    if (!store.get('SELECT id FROM conversations WHERE id=?', req.params.id)) return res.sendStatus(404);
+    if (!store.get('SELECT id FROM conversations WHERE id=? AND deleted_at IS NULL', req.params.id)) return res.sendStatus(404);
     integration.queueAnalysis(req.params.id);
     res.json({ queued: true });
   });

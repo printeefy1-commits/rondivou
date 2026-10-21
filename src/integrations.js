@@ -42,7 +42,7 @@ export function integrations(store, config, request = fetch) {
   function queueMissingProfiles({ retryFailed = false } = {}) {
     if (!config.META_PAGE_ACCESS_TOKEN) return 0;
     let count = 0;
-    for (const c of store.all('SELECT id FROM conversations WHERE username=external_id')) {
+    for (const c of store.all('SELECT id FROM conversations WHERE username=external_id AND deleted_at IS NULL')) {
       const pending = store.get("SELECT id,error FROM outbox WHERE kind='meta_profile' AND sent_at IS NULL AND json_extract(payload,'$.conversationId')=?", c.id);
       if (!pending) {
         store.enqueue('meta_profile', { conversationId: c.id });
@@ -60,9 +60,11 @@ export function integrations(store, config, request = fetch) {
     const id = randomUUID();
     const stamp = new Date(sentAt);
     if (!Number.isFinite(stamp.getTime())) throw new Error('Horodatage du message invalide.');
+    if ((c.cleared_at && stamp.toISOString() <= c.cleared_at) || (c.deleted_at && historical)) return { ignored: true };
+    if (c.deleted_at) store.run('UPDATE conversations SET deleted_at=NULL WHERE id=?',c.id);
     const inserted = store.run('INSERT OR IGNORE INTO messages VALUES(?,?,?,?,?,?,?)', id, c.id, String(messageId), text.slice(0, 20000), direction, stamp.toISOString(), Number(historical));
     if (!inserted.changes) {
-      // Import membership matters for style learning even if a webhook saved the text first.
+      // Preserve import provenance even if a webhook saved the text first.
       // Do not replay forwarding, analysis or booking for a duplicate imported message.
       if (historical) store.run('UPDATE messages SET historical=1 WHERE conversation_id=? AND external_id=?',c.id,String(messageId));
       return { duplicate: true };
@@ -136,7 +138,7 @@ export function integrations(store, config, request = fetch) {
       if (!match) return;
       await telegram('answerCallbackQuery', { callback_query_id: callback.id, ...(cards.enabled && match[1] === 'plan' ? { text: 'Utilisez « Ouvrir sur le site » dans la carte pour compléter le formulaire.' } : {}) });
       const c = store.get('SELECT * FROM conversations WHERE id=?', match[2]);
-      if (!c) return;
+      if (!c || c.deleted_at) return;
       const candidate = store.candidate(c.id);
       // Explicit preview is mandatory for ambiguous/incomplete data and ALL historical imports.
       const historical = store.context(c.id).some(m => m.historical);
@@ -162,7 +164,7 @@ export function integrations(store, config, request = fetch) {
   async function analyzeConversation(conversationId) {
     const c = store.get('SELECT * FROM conversations WHERE id=?', conversationId);
     const messages = store.context(conversationId);
-    if (!c || !messages.length || !aiEnabled(config)) return;
+    if (!c || c.deleted_at || !messages.length || !aiEnabled(config)) return;
     const key = contextKey(messages);
     const result = await analyze(messages, config, request);
     // Messages or manual bookings may arrive while the model is responding.
@@ -209,12 +211,12 @@ export function integrations(store, config, request = fetch) {
           else if (job.kind === 'ai_extract') await analyzeConversation(payload.conversationId);
           else if (job.kind === 'meta_profile') {
             const c = store.get('SELECT * FROM conversations WHERE id=?', payload.conversationId);
-            if (c && c.username === c.external_id) {
+            if (c && !c.deleted_at && c.username === c.external_id) {
               const profile = await graph(c.external_id, { fields: c.channel === 'instagram' ? 'name,username' : 'first_name,last_name' });
               const name = profile.username || profile.name || [profile.first_name, profile.last_name].filter(Boolean).join(' ');
               if (!name?.trim() || name === c.external_id) throw new Error('Meta ne fournit pas encore de nom pour ce compte. Nouvelle tentative programmée.');
               if (name) {
-                const updated = store.run('UPDATE conversations SET username=? WHERE id=? AND username=external_id', name, c.id);
+                const updated = store.run('UPDATE conversations SET username=? WHERE id=? AND username=external_id AND deleted_at IS NULL', name, c.id);
                 if (updated.changes) {
                   if (cards.enabled) cards.queue(c.id);
                   else store.enqueue('telegram', { text: `👤 ${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${name}\nProfil identifié pour la conversation ${c.external_id}.`, reply_markup: buttons(c.id) });
@@ -280,7 +282,7 @@ export function integrations(store, config, request = fetch) {
           texts.sort((a, b) => new Date(a.created_time) - new Date(b.created_time));
           for (const m of texts) {
             const result = ingest({ channel, externalId: String(participant.id), username: participant.username || participant.name || String(participant.id), messageId: m.id, text: m.message, direction: own.has(String(m.from?.id)) ? 'out' : 'in', sentAt: m.created_time, historical: true });
-            if (!result.duplicate) imported++;
+            if (!result.duplicate && !result.ignored) imported++;
           }
         }
         after = page.paging?.next ? page.paging?.cursors?.after : undefined;
