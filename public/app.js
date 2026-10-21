@@ -141,7 +141,7 @@ async function openConversation(id, matchId) {
     const latest = c.messages.at(-1);
     $('#conversation-detail').innerHTML = `<div class="conversation-header"><div><h2>${escape(c.username)}</h2><small>${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.messages.length} messages</small><small class="conversation-start">Début des échanges disponibles : ${escape(format(c.started_at || c.messages[0]?.sent_at || c.created_at, { dateStyle: 'long', timeStyle: 'short', hour12: false }))}</small><span class="message-order">↓ Derniers messages en bas</span></div><button class="outline small" id="dismiss-review">Marquer comme traité</button></div><div class="message-list">${c.messages.map(m => `<div data-message-id="${escape(m.id)}" class="message ${m.id === matchId ? 'search-match ' : ''}${m.direction === 'out' ? 'out' : ''}" dir="auto"><small>${m.direction === 'out' ? 'Salon' : 'Cliente'} · ${escape(format(m.sent_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }))}${m.historical ? ' · Historique' : ''}</small>${escape(m.text)}</div>`).join('')}</div><div class="candidate-panel"><div class="candidate-values"><span>◷ ${escape(candidate.date || 'Date manquante')}</span><span>${escape(candidate.time || 'Heure manquante')}</span><span>${escape(service(candidate.service)?.name || 'Prestation manquante')}</span></div><p>${candidate.ai_pending ? 'Analyse IA en attente. Vous pouvez compléter le formulaire manuellement.' : historical ? 'Historique : vérifiez le contexte et la date avant de créer un rendez-vous.' : candidate.ambiguous ? 'Plusieurs informations possibles : sélectionnez les bonnes valeurs dans le formulaire.' : 'Vérifiez les informations avant de confirmer le rendez-vous.'}</p><div class="candidate-actions">${candidate.source === 'ai' || candidate.ai_pending ? '<button class="outline" id="analyze-conversation">Analyser avec IA</button>' : ''}<button class="primary" id="plan-conversation">rondivou ↗</button><button class="outline" id="confirm-conversation">rondivou confirmé</button></div></div>`;
     if ($('#analyze-conversation')) $('#analyze-conversation').onclick = async () => { try { await api(`/conversations/${id}/analyze`, { method: 'POST', body: '{}' }); toast('Analyse IA programmée.'); } catch (e) { toast(e.message); } };
-    const plan = () => openBooking({ ...candidate, conversation_id: c.id, source_message_id: latest?.id || '', context: `${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.username}${historical ? ' · Import historique : validation manuelle' : ''}` });
+    const plan = () => openBooking({ ...candidate, channel: c.channel, username: c.username, conversation_id: c.id, source_message_id: latest?.id || '', context: `${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.username}${historical ? ' · Import historique : validation manuelle' : ''}` });
     $('#plan-conversation').onclick = plan; $('#confirm-conversation').onclick = plan;
     $('#dismiss-review').onclick = async () => { try { await api(`/conversations/${id}/dismiss`, { method: 'POST', body: '{}' }); await refresh(); toast('Conversation marquée comme traitée.'); } catch (e) { toast(e.message); } };
     const messageList = $('.message-list');
@@ -162,7 +162,7 @@ function openBooking(values = {}) {
   const form = $('#booking-form'); form.reset(); $('#booking-error').textContent = '';
   const channel = values.channel === 'instagram' ? 'IG' : values.channel === 'messenger' ? 'FB' : '';
   const account = channel && values.username ? ` pour ${values.username} (${channel})` : '';
-  $('#booking-title').textContent = values.id ? `Modifier le rendez-vous${account}` : 'Nouveau rendez-vous';
+  $('#booking-title').textContent = values.id ? `Modifier le rendez-vous${account}` : `Nouveau rendez-vous${account}`;
   $('#booking-context').textContent = values.context || '';
   for (const key of ['id', 'conversation_id', 'source_message_id', 'date', 'time', 'service', 'client_name', 'phone', 'notes']) form.elements[key].value = values[key] || (key === 'date' ? selectedDate : '');
   durationHint(); $('#booking-dialog').showModal();
@@ -211,7 +211,7 @@ async function openDeepLink() {
   if (id) {
     switchView('messages'); await openConversation(id);
     const c = await api('/conversations/' + encodeURIComponent(id));
-    openBooking({ ...c.candidate, conversation_id: c.id, source_message_id: c.messages.at(-1)?.id || '', context: c.username + ' · Vérifiez les informations avant envoi.' });
+    openBooking({ ...c.candidate, channel: c.channel, username: c.username, conversation_id: c.id, source_message_id: c.messages.at(-1)?.id || '', context: c.username + ' · Vérifiez les informations avant envoi.' });
     history.replaceState({}, '', '/');
   }
 }
