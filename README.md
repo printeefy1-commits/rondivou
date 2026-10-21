@@ -19,6 +19,8 @@ npm test
 
 Les tests utilisent une base éphémère et des services distants simulés ; ils n'envoient pas de vrais messages. `/health` fournit une vérification HTTP sans données clientes. Le calendrier, les rendez-vous, les conversations et les réglages nécessitent une connexion administrateur.
 
+En production, la première connexion demande de remplacer le mot de passe initial par un mot de passe personnel d'au moins 16 caractères. Son empreinte avec sel est conservée dans la base SQLite ; les redémarrages et mises à jour ne la remplacent pas. Après le changement, le fichier de mot de passe initial ne sert plus à se connecter. Le changement reste accessible dans Connexions ; en cas d'oubli, utiliser la version actuelle de `deploy/reset-admin-password.py` (voir DEPLOYMENT.md).
+
 ## Réservation
 
 - Une seule professionnelle, interdiction des chevauchements, horaires flexibles tous les jours.

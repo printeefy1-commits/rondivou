@@ -16,12 +16,10 @@ if (!config.ADMIN_PASSWORD) {
   console.log('Mot de passe administrateur local : fichier .data/admin-password (non suivi par Git).');
 }
 const store = createStore(config.DATABASE_PATH || '.data/rondivou.sqlite');
-const { app, integration, learning } = createApp(store, config);
+const { app, integration } = createApp(store, config);
 integration.queueMissingProfiles({ retryFailed: true });
 const server = app.listen(Number(config.PORT || 3000), config.HOST || '127.0.0.1', () => console.log('Rondivou démarré · fuseau Africa/Algiers · port ' + (config.PORT || 3000)));
 const timer = setInterval(() => { integration.scheduleReminders(); integration.flush().catch(() => store.notify('warning', 'Erreur du traitement des notifications.')); }, 1000);
 timer.unref();
-const learningTimer = setInterval(() => { learning.tick().catch(() => store.notify('warning', 'Analyse du style interrompue. Consultez le laboratoire IA.')); }, 3000);
-learningTimer.unref();
-function stop() { clearInterval(timer); clearInterval(learningTimer); server.close(() => { store.close(); process.exit(0); }); }
+function stop() { clearInterval(timer); server.close(() => { store.close(); process.exit(0); }); }
 process.on('SIGTERM', stop); process.on('SIGINT', stop);

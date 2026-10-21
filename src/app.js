@@ -1,17 +1,16 @@
 import express from 'express';
-import { randomBytes, scryptSync, timingSafeEqual, createHmac } from 'node:crypto';
+import { randomBytes, timingSafeEqual, createHmac } from 'node:crypto';
 import { resolve } from 'node:path';
 import { SERVICES } from './domain.js';
 import { integrations } from './integrations.js';
 import { aiEnabled } from './ai.js';
-import { styleLab, redactStyle } from './style-lab.js';
+import { passwords } from './passwords.js';
 
 export function createApp(store, config, request, audit = record => console.info(JSON.stringify(record))) {
   const app = express();
   app.disable('x-powered-by');
   const integration = integrations(store, config, request);
-  const learning = styleLab(store, config, request);
-  const passwordHash = scryptSync(config.ADMIN_PASSWORD, 'rondivou-admin', 64);
+  const auth = passwords(store, config);
   const failures = new Map();
   let importRunning = false;
   app.use((req, res, next) => {
@@ -71,13 +70,14 @@ export function createApp(store, config, request, audit = record => console.info
     next();
   });
   const sessionId = req => /(?:^|;\s*)rondivou_session=([a-f0-9]+)/.exec(req.get('cookie') || '')?.[1];
-  app.get('/api/session', (req, res) => res.json({ authenticated: Boolean(store.get('SELECT id FROM sessions WHERE id=? AND expires_at>?', sessionId(req) || '', Date.now())) }));
+  const setSessionCookie = (res,id) => res.set('Set-Cookie', `rondivou_session=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400${config.COOKIE_SECURE === 'true' ? '; Secure' : ''}`);
+  app.get('/api/session', (req,res) => { const authenticated = Boolean(store.get('SELECT id FROM sessions WHERE id=? AND expires_at>?',sessionId(req)||'',Date.now())); res.json({authenticated,passwordChangeRequired:authenticated && auth.required()}); });
   app.post('/api/login', (req, res) => {
     const key = req.ip;
     const failure = failures.get(key);
     if (failure?.count >= 5 && failure.until > Date.now()) return res.status(429).json({ error: 'Trop de tentatives. Réessayez dans 15 minutes.' });
-    const value = typeof req.body.password === 'string' ? req.body.password.slice(0, 1024) : '';
-    if (!timingSafeEqual(scryptSync(value, 'rondivou-admin', 64), passwordHash)) {
+    const value = typeof req.body.password === 'string' ? req.body.password : '';
+    if (!auth.verify(value)) {
       failures.set(key, { count: (failure?.until > Date.now() ? failure.count : 0) + 1, until: Date.now() + 900000 });
       return res.status(401).json({ error: 'Mot de passe incorrect.' });
     }
@@ -85,14 +85,29 @@ export function createApp(store, config, request, audit = record => console.info
     store.run('DELETE FROM sessions WHERE expires_at<?', Date.now());
     const id = randomBytes(32).toString('hex');
     store.run('INSERT INTO sessions VALUES(?,?)', id, Date.now() + 86400000);
-    res.set('Set-Cookie', `rondivou_session=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400${config.COOKIE_SECURE === 'true' ? '; Secure' : ''}`);
-    res.json({ ok: true });
+    setSessionCookie(res,id);
+    res.json({ ok: true, passwordChangeRequired: auth.required() });
   });
   app.use('/api', (req, res, next) => {
     if (!store.get('SELECT id FROM sessions WHERE id=? AND expires_at>?', sessionId(req) || '', Date.now())) return res.status(401).json({ error: 'Connexion requise.' });
     next();
   });
   app.post('/api/logout', (req, res) => { store.run('DELETE FROM sessions WHERE id=?', sessionId(req)); res.set('Set-Cookie', 'rondivou_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0'); res.json({ ok: true }); });
+  app.post('/api/password', (req,res,next) => {
+    const key=req.ip;
+    const failure=failures.get(key);
+    if (failure?.count >= 5 && failure.until > Date.now()) return res.status(429).json({error:'Trop de tentatives. Réessayez dans 15 minutes.'});
+    try {
+      const id=auth.change(req.body.currentPassword,req.body.newPassword);
+      failures.delete(key);
+      setSessionCookie(res,id);
+      res.json({ok:true,passwordChangeRequired:false});
+    } catch(e) {
+      if (e.status === 401) { failures.set(key,{count:(failure?.until > Date.now()?failure.count:0)+1,until:Date.now()+900000}); e.status=400; }
+      next(e);
+    }
+  });
+  app.use('/api',(_req,res,next) => auth.required() ? res.status(403).json({error:'Choisissez votre nouveau mot de passe pour continuer.',code:'password_change_required'}) : next());
   app.get('/api/dashboard', (_req, res) => {
     const conversations = store.all(`SELECT c.*, (SELECT text FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_text,
       (SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at,
@@ -142,37 +157,6 @@ export function createApp(store, config, request, audit = record => console.info
     res.json({ ok: true });
   });
   app.post('/api/notifications/read', (_req, res) => { store.run('UPDATE notifications SET read_at=? WHERE read_at IS NULL', store.now()); res.json({ ok: true }); });
-  app.get('/api/style', (_req, res) => res.json(learning.report()));
-  app.post('/api/style/learn', (_req, res, next) => { if (importRunning) return res.status(409).json({error:'Attendez la fin de l’import avant d’analyser tous les messages.'}); try { res.status(202).json({ id: learning.start() }); } catch(e) { next(e); } });
-  app.post('/api/style/runs/:id/:action', (req, res) => {
-    if (!['pause','resume'].includes(req.params.action)) return res.sendStatus(404);
-    const run = store.get('SELECT * FROM style_runs WHERE id=?', req.params.id);
-    if (!run) return res.sendStatus(404);
-    const allowed = req.params.action === 'pause' ? ['queued','running'] : ['paused','failed'];
-    if (!allowed.includes(run.status)) return res.status(409).json({ error: 'Cette action ne convient pas à l’état actuel de l’analyse.' });
-    if (req.params.action === 'resume') store.run("UPDATE style_chunks SET status='pending',result=NULL WHERE run_id=? AND status='failed'",run.id);
-    store.run('UPDATE style_runs SET status=?,error=NULL WHERE id=?', req.params.action === 'pause' ? 'paused' : 'queued', run.id);
-    res.json({ ok: true });
-  });
-  app.post('/api/style/chunks/:id/exclude', (req, res) => {
-    if (!store.get('SELECT id FROM style_chunks WHERE id=?',req.params.id)) return res.sendStatus(404);
-    store.run("UPDATE style_chunks SET status='excluded',result=NULL WHERE id=?",req.params.id);
-    res.json({ ok:true });
-  });
-  let testingStyle = false;
-  app.post('/api/style/test', async (req,res,next) => {
-    if (testingStyle) return res.status(409).json({error:'Un test est déjà en cours.'});
-    testingStyle = true;
-    try { res.json(await learning.test(req.body.message)); } catch(e) { next(e); } finally { testingStyle = false; }
-  });
-  app.post('/api/style/tests/:id/feedback', (req,res) => {
-    if (!['approved','rejected','corrected'].includes(req.body.feedback)) return res.status(400).json({error:'Évaluation invalide.'});
-    const correction = req.body.correction || '';
-    if (typeof correction !== 'string' || correction.length > 2000 || (req.body.feedback === 'corrected' && !correction.trim())) return res.status(400).json({error:'Écrivez une correction (2 000 caractères maximum).'});
-    if (!store.get('SELECT id FROM style_tests WHERE id=?',req.params.id)) return res.sendStatus(404);
-    store.run('UPDATE style_tests SET feedback=?,correction=? WHERE id=?',req.body.feedback,redactStyle(correction),req.params.id);
-    res.json({ok:true});
-  });
   app.post('/api/integrations/telegram/connect', async (_req, res, next) => {
     try {
       if (!config.PUBLIC_URL?.startsWith('https://') || !config.TELEGRAM_WEBHOOK_SECRET || !/^\d+$/.test(config.TELEGRAM_ADMIN_ID || '')) throw Object.assign(new Error('Configurez PUBLIC_URL en HTTPS, TELEGRAM_ADMIN_ID et TELEGRAM_WEBHOOK_SECRET.'), { status: 400 });
@@ -193,5 +177,5 @@ export function createApp(store, config, request, audit = record => console.info
   });
   app.use(express.static(resolve(import.meta.dirname, '../public')));
   app.use((err, _req, res, _next) => res.status(err.status || 400).json({ error: err.status || !err.code ? err.message : 'Opération impossible. Vérifiez les données.' }));
-  return { app, integration, learning };
+  return { app, integration };
 }

@@ -15,13 +15,10 @@ export function createStore(path = '.data/rondivou.sqlite') {
     CREATE TABLE IF NOT EXISTS notifications(id TEXT PRIMARY KEY, kind TEXT NOT NULL, text TEXT NOT NULL, created_at TEXT NOT NULL, read_at TEXT);
     CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT NOT NULL, sent_at TEXT, error TEXT);
     CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS admin_credentials(id INTEGER PRIMARY KEY CHECK(id=1),salt TEXT NOT NULL,password_hash TEXT NOT NULL,must_change INTEGER NOT NULL,updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS telegram_updates(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS ai_analyses(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), context_key TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS telegram_cards(conversation_id TEXT NOT NULL REFERENCES conversations(id), chat_id TEXT NOT NULL, message_id TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(conversation_id,chat_id));
-    CREATE TABLE IF NOT EXISTS style_runs(id TEXT PRIMARY KEY,created_at TEXT NOT NULL,message_count INTEGER NOT NULL,chunk_count INTEGER NOT NULL,status TEXT NOT NULL,error TEXT);
-    CREATE TABLE IF NOT EXISTS style_chunks(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES style_runs(id),conversation_id TEXT NOT NULL REFERENCES conversations(id),messages TEXT NOT NULL,created_at TEXT NOT NULL,status TEXT NOT NULL,result TEXT);
-    CREATE TABLE IF NOT EXISTS style_tests(id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES style_runs(id),prompt TEXT NOT NULL,reply TEXT NOT NULL,needs_human INTEGER NOT NULL,feedback TEXT NOT NULL,correction TEXT NOT NULL,created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS style_retries(run_id TEXT PRIMARY KEY REFERENCES style_runs(id),next_at TEXT NOT NULL,attempts INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS appointment_range ON appointments(start_at,end_at);
     CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id,sent_at);
   `);

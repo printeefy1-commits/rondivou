@@ -42,6 +42,27 @@ def docker(*args):
     return subprocess.run(['docker', *args], check=True, capture_output=True, text=True).stdout.strip()
 
 
+
+def reset_credentials(image, password):
+    # Plaintext travels over stdin only, never in process arguments or logs.
+    code = """import {DatabaseSync} from 'node:sqlite';
+import {readFileSync} from 'node:fs';
+import {randomBytes,scryptSync} from 'node:crypto';
+const password=readFileSync(0,'utf8');
+const db=new DatabaseSync('/data/rondivou.sqlite');
+db.exec('BEGIN IMMEDIATE');
+try {
+ if(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='admin_credentials'").get()) {
+  const salt=randomBytes(32).toString('hex');
+  const hash=scryptSync(password,salt,64).toString('hex');
+  db.prepare('INSERT INTO admin_credentials VALUES(1,?,?,1,?) ON CONFLICT(id) DO UPDATE SET salt=excluded.salt,password_hash=excluded.password_hash,must_change=1,updated_at=excluded.updated_at').run(salt,hash,new Date().toISOString());
+ }
+ db.exec('DELETE FROM sessions'); db.exec('COMMIT');
+} catch(e) {db.exec('ROLLBACK'); throw e;} finally {db.close();}
+"""
+    subprocess.run(['docker','run','--rm','-i','--user','1000:1000','--mount','type=bind,source=/var/lib/rondivou/database,target=/data',image,'node','--input-type=module','-e',code], input=password, capture_output=True, text=True, check=True)
+
+
 def main():
     if os.geteuid() != 0:
         raise SystemExit('Run with sudo python3.')
@@ -64,8 +85,7 @@ def main():
     docker('rename', 'rondivou', backup)
     try:
         password = rotate_files(directory)
-        docker('run', '--rm', '--user', '1000:1000', '--mount', 'type=bind,source=/var/lib/rondivou/database,target=/data', image,
-               'node', '--input-type=module', '-e', "import {DatabaseSync} from 'node:sqlite'; const db=new DatabaseSync('/data/rondivou.sqlite'); db.exec('DELETE FROM sessions'); db.close();")
+        reset_credentials(image, password)
         docker('run', '-d', '--name', 'rondivou', '--restart', 'unless-stopped', '--network', 'host', '--user', '1000:1000',
                '--env-file', '/opt/rondivou/runtime.env', '--workdir', '/app',
                '--mount', 'type=bind,source=/opt/rondivou,target=/app,readonly',
