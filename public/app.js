@@ -131,7 +131,9 @@ function renderNotifications() {
 }
 function openBooking(values = {}) {
   const form = $('#booking-form'); form.reset(); $('#booking-error').textContent = '';
-  $('#booking-title').textContent = values.id ? 'Modifier le rendez-vous' : 'Nouveau rendez-vous';
+  const channel = values.channel === 'instagram' ? 'IG' : values.channel === 'messenger' ? 'FB' : '';
+  const account = channel && values.username ? ` pour ${values.username} (${channel})` : '';
+  $('#booking-title').textContent = values.id ? `Modifier le rendez-vous${account}` : 'Nouveau rendez-vous';
   $('#booking-context').textContent = values.context || '';
   for (const key of ['id', 'conversation_id', 'source_message_id', 'date', 'time', 'service', 'client_name', 'phone', 'notes']) form.elements[key].value = values[key] || (key === 'date' ? selectedDate : '');
   durationHint(); $('#booking-dialog').showModal();
