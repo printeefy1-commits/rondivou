@@ -172,7 +172,7 @@ export function createApp(store, config, request, audit = record => console.info
       const conflict = store.get("SELECT id FROM appointments WHERE id!=? AND status!='cancelled' AND start_at<? AND end_at>?", a.id, a.end_at, a.start_at);
       if (conflict) return res.status(409).json({ error: 'Impossible de rétablir ce rendez-vous : créneau occupé.' });
     }
-    store.run('UPDATE appointments SET status=?,updated_at=? WHERE id=?', req.body.status, store.now(), req.params.id);
+    store.run('UPDATE appointments SET status=?,attendance_confirmed_at=?,updated_at=? WHERE id=?', req.body.status, req.body.status === 'confirmed' && a.status === 'waiting_confirmation' ? store.now() : a.attendance_confirmed_at,store.now(),req.params.id);
     store.notify('status', `Statut du rendez-vous mis à jour : ${req.body.status}`);
     if (a.conversation_id) integration.refreshCard(a.conversation_id);
     res.json({ ok: true });

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { extract, isAgreement, isChange } from './domain.js';
 import { analyze, aiEnabled, contextKey } from './ai.js';
 import { telegramCards } from './telegram-cards.js';
+import { reminderSchedule, eligibleReminder, isAttendanceConfirmation } from './reminders.js';
 
 export function integrations(store, config, request = fetch) {
   const graphVersion = config.META_GRAPH_VERSION || 'v23.0';
@@ -80,16 +81,19 @@ export function integrations(store, config, request = fetch) {
       store.enqueue('telegram', { text: `${historical ? '🗂 Historique · ' : ''}${channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.username}\n${direction === 'out' ? 'Salon' : 'Cliente'} · ${new Intl.DateTimeFormat('fr-DZ', { timeZone: 'Africa/Algiers', dateStyle: 'short', timeStyle: 'short' }).format(stamp)}${chars.length > 2800 ? ` · partie ${offset / 2800 + 1}` : ''}\n\n${chars.slice(offset, offset + 2800).join('')}`, reply_markup: buttons(c.id) });
     }
     const waiting = store.all("SELECT * FROM appointments WHERE conversation_id=? AND status='waiting_confirmation' AND start_at>? ORDER BY start_at", c.id, store.now());
-    if (!historical && direction === 'in' && waiting.length && isAgreement(text) && !isChange(text)) {
+    if (!historical && direction === 'in' && waiting.length && isAttendanceConfirmation(text) && !isChange(text)) {
       const reply = extract([message]);
-      if (waiting.length !== 1 || reply.date || reply.time || reply.service || reply.ambiguous) {
+      const target = waiting[0];
+      const localStart = new Date(Date.parse(target.start_at)+3600000).toISOString();
+      const conflicts = (reply.date && reply.date !== localStart.slice(0,10)) || (reply.time && reply.time !== localStart.slice(11,16)) || (reply.service && reply.service !== target.service);
+      if (waiting.length !== 1 || conflicts || reply.ambiguous || (target.reminder_sent_at && stamp < new Date(target.reminder_sent_at))) {
         review(c, message, 'attendance_ambiguous');
         store.enqueue('telegram', { text: `⚠️ Confirmation à vérifier pour ${c.username} : le rendez-vous visé n’est pas certain.`, reply_markup: buttons(c.id) });
         return { conversation_id: c.id, message_id: id, needsReview: true };
       }
-      store.run("UPDATE appointments SET status='confirmed',updated_at=? WHERE id=?", store.now(), waiting[0].id);
+      store.run("UPDATE appointments SET status='confirmed',attendance_confirmed_at=?,updated_at=? WHERE id=?", stamp.toISOString(),store.now(), waiting[0].id);
       store.notify('confirmation', `${c.username} a confirmé sa présence.`);
-      store.enqueue('telegram', { text: `✅ ${c.username} a confirmé sa présence.` });
+      store.enqueue('telegram', { text: `✅ ${c.username} a confirmé sa présence.\n${new Intl.DateTimeFormat('fr-DZ', { timeZone:'Africa/Algiers',dateStyle:'short',timeStyle:'short',hour12:false }).format(new Date(waiting[0].start_at))} · ${waiting[0].service}` });
       cards.queue(c.id);
       return { conversation_id: c.id, message_id: id, attendanceConfirmed: true };
     }
@@ -202,11 +206,32 @@ export function integrations(store, config, request = fetch) {
     working = true;
     try {
       // Resolve identities before slow historical AI work; retries still respect next_at.
-      const jobs = store.all("SELECT * FROM outbox WHERE sent_at IS NULL AND next_at<=? ORDER BY CASE WHEN kind='meta_profile' THEN 0 WHEN kind IN ('telegram','telegram_card') THEN 1 ELSE 2 END,rowid LIMIT 1", store.now());
+      const jobs = store.all("SELECT * FROM outbox WHERE sent_at IS NULL AND next_at<=? ORDER BY CASE WHEN kind='meta_profile' THEN 0 WHEN kind IN ('telegram','telegram_card','telegram_reminder') THEN 1 ELSE 2 END,rowid LIMIT 1", store.now());
       for (const job of jobs) {
         try {
           const payload = JSON.parse(job.payload);
-          if (job.kind === 'telegram' && !cards.absorbLegacy(payload)) await telegram('sendMessage', { chat_id: config.TELEGRAM_ADMIN_ID, ...payload });
+          if (job.kind === 'meta_reminder' || job.kind === 'telegram_reminder') {
+            const a = store.get('SELECT * FROM appointments WHERE id=?',payload.appointmentId);
+            const event = store.get('SELECT * FROM reminder_events WHERE appointment_id=? AND version=? AND stage=?',payload.appointmentId,payload.version || '',payload.stage || '');
+            const sentColumn = job.kind === 'meta_reminder' ? 'meta_sent_at' : 'telegram_sent_at';
+            if (!a || !event || a.reminder_version !== payload.version || a.start_at !== payload.startAt || event.due_at !== payload.dueAt || event[sentColumn] || !eligibleReminder(a,payload.stage)) {
+              store.run('UPDATE outbox SET sent_at=?,error=NULL WHERE id=?',store.now(),job.id); continue;
+            }
+            if (job.kind === 'telegram_reminder') await telegram('sendMessage',{chat_id:config.TELEGRAM_ADMIN_ID,text:payload.text});
+            else {
+              const c = store.get('SELECT * FROM conversations WHERE id=?',a.conversation_id);
+              if (!c) throw new Error('Aucune conversation liée au rendez-vous.');
+              const text = `Bonjour ! ${payload.stage === 'morning' ? 'Nous attendons votre confirmation. ' : ''}Merci de confirmer votre présence pour votre rendez-vous du ${new Intl.DateTimeFormat('fr-DZ', { timeZone:'Africa/Algiers',dateStyle:'short',timeStyle:'short',hour12:false }).format(new Date(a.start_at))} (${a.service}). Répondez à ce message pour confirmer. À bientôt !`;
+              await graph(`${c.channel === 'instagram' ? config.META_INSTAGRAM_ID : config.META_PAGE_ID}/messages`,{recipient:{id:c.external_id},message:{text},...(c.channel === 'messenger' ? {messaging_type:'RESPONSE'} : {})},'POST');
+            }
+            store.run(`UPDATE reminder_events SET ${sentColumn}=? WHERE appointment_id=? AND version=? AND stage=?`,store.now(),a.id,payload.version,payload.stage);
+            if (job.kind === 'meta_reminder') {
+              // A confirmation or edit received during the API call must survive.
+              const updated = store.run("UPDATE appointments SET reminder_sent_at=COALESCE(reminder_sent_at,?),status='waiting_confirmation',updated_at=? WHERE id=? AND reminder_version=? AND attendance_confirmed_at IS NULL AND status!='cancelled'",store.now(),store.now(),a.id,payload.version);
+              if (updated.changes) { store.notify('reminder','Rappel envoyé : en attente de confirmation de la cliente.'); cards.queue(a.conversation_id); }
+            }
+          }
+          else if (job.kind === 'telegram' && !cards.absorbLegacy(payload)) await telegram('sendMessage', { chat_id: config.TELEGRAM_ADMIN_ID, ...payload });
           else if (job.kind === 'telegram_card') await cards.deliver(payload.conversationId);
           else if (job.kind === 'ai_extract') await analyzeConversation(payload.conversationId);
           else if (job.kind === 'meta_profile') {
@@ -224,36 +249,36 @@ export function integrations(store, config, request = fetch) {
               }
             }
           }
-          else if (job.kind === 'meta_reminder') {
-            const a = store.get('SELECT * FROM appointments WHERE id=?', payload.appointmentId);
-            if (!a || a.status === 'cancelled' || a.start_at !== payload.startAt || a.reminder_sent_at || new Date(a.start_at) <= new Date()) { store.run('UPDATE outbox SET sent_at=? WHERE id=?', store.now(), job.id); continue; }
-            const c = store.get('SELECT * FROM conversations WHERE id=?', a.conversation_id);
-            if (!c) throw new Error('Aucune conversation liée au rendez-vous.');
-            const text = `Bonjour ! Merci de confirmer votre présence pour votre rendez-vous du ${new Intl.DateTimeFormat('fr-DZ', { timeZone: 'Africa/Algiers', dateStyle: 'short', timeStyle: 'short' }).format(new Date(a.start_at))} (${a.service}). Répondez à ce message pour confirmer. À bientôt !`;
-            await graph(`${c.channel === 'instagram' ? config.META_INSTAGRAM_ID : config.META_PAGE_ID}/messages`, { recipient: { id: c.external_id }, message: { text }, ...(c.channel === 'messenger' ? { messaging_type: 'RESPONSE' } : {}) }, 'POST');
-            store.run("UPDATE appointments SET reminder_sent_at=?,status='waiting_confirmation',updated_at=? WHERE id=?", store.now(), store.now(), a.id);
-            store.notify('reminder', 'Rappel envoyé : en attente de confirmation de la cliente.');
-          }
           store.run('UPDATE outbox SET sent_at=?,error=NULL WHERE id=?', store.now(), job.id);
         } catch (e) {
           const attempts = job.attempts + 1;
           store.run('UPDATE outbox SET attempts=?,next_at=?,error=? WHERE id=?', attempts, new Date(Date.now() + Math.min(3600000, 30000 * 2 ** Math.min(attempts, 7))).toISOString(), e.message, job.id);
-          if (attempts === 1) store.notify('warning', `${job.kind === 'ai_extract' ? 'Analyse IA' : job.kind === 'meta_profile' ? 'Lecture du profil Meta' : job.kind === 'telegram' ? 'Envoi Telegram' : 'Envoi du rappel Meta'} impossible. Vérifiez la connexion et les permissions dans les paramètres.`);
+          if (attempts === 1) store.notify('warning', `${job.kind === 'ai_extract' ? 'Analyse IA' : job.kind === 'meta_profile' ? 'Lecture du profil Meta' : ['telegram','telegram_reminder','telegram_card'].includes(job.kind) ? 'Envoi Telegram' : 'Envoi du rappel Meta'} impossible. Vérifiez la connexion et les permissions dans les paramètres.`);
         }
       }
     } finally { working = false; }
   }
   function scheduleReminders(reference = new Date()) {
-    for (const a of store.all("SELECT * FROM appointments WHERE status='confirmed' AND reminder_sent_at IS NULL AND start_at>? AND start_at<=?", reference.toISOString(), new Date(reference.getTime() + 86400000).toISOString())) {
-      // Bookings created less than 24 hours before the slot never get reminders.
-      if (new Date(a.start_at) - new Date(a.created_at) < 86400000) continue;
-      if (a.reminder_queued_start === a.start_at) continue;
-      if (store.get("SELECT id FROM outbox WHERE kind='meta_reminder' AND json_extract(payload,'$.appointmentId')=? AND json_extract(payload,'$.startAt')=?", a.id, a.start_at)) continue;
-      store.notify('reminder', `Rendez-vous dans 24 h · ${a.client_name || 'Cliente'} · ${a.service}`);
-      store.enqueue('telegram', { text: `🔔 Rendez-vous dans 24 h\n${a.client_name || 'Cliente'} · ${a.service}\nLe rappel cliente nécessite une connexion Meta autorisée.` });
-      if (a.conversation_id) store.enqueue('meta_reminder', { appointmentId: a.id, startAt: a.start_at });
-      else store.notify('warning', 'Rappel cliente impossible : ce rendez-vous manuel ne possède pas de conversation liée.');
-      store.run('UPDATE appointments SET reminder_queued_start=? WHERE id=?', a.start_at, a.id);
+    for (const a of store.all("SELECT a.*,c.username,c.channel FROM appointments a LEFT JOIN conversations c ON c.id=a.conversation_id WHERE a.status IN ('confirmed','waiting_confirmation') AND a.attendance_confirmed_at IS NULL AND a.start_at>?",reference.toISOString())) {
+      for (const event of reminderSchedule(a.start_at)) {
+        if (!eligibleReminder(a,event.stage,reference)) continue;
+        store.db.exec('BEGIN IMMEDIATE');
+        try {
+          const inserted = store.run('INSERT OR IGNORE INTO reminder_events(appointment_id,version,stage,due_at,start_at,queued_at) VALUES(?,?,?,?,?,?)',a.id,a.reminder_version,event.stage,event.dueAt,a.start_at,reference.toISOString());
+          if (inserted.changes) {
+            const when = new Intl.DateTimeFormat('fr-DZ',{timeZone:'Africa/Algiers',dateStyle:'short',timeStyle:'short',hour12:false}).format(new Date(a.start_at));
+            const account = a.channel ? `${a.channel === 'instagram' ? 'IG' : 'FB'}: ${a.username}` : a.client_name || 'Cliente';
+            const label = event.stage === 'evening' ? 'Rappel de la veille' : 'Relance du matin · présence non confirmée';
+            const payload = {appointmentId:a.id,version:a.reminder_version,startAt:a.start_at,stage:event.stage,dueAt:event.dueAt};
+            store.notify('reminder',`${label} · ${when} · ${account} · ${a.service}`);
+            store.enqueue('telegram_reminder',{...payload,text:`🔔 ${label}\n${when} · ${a.service}\n${account}${a.phone ? `\nTél. ${a.phone}` : ''}`});
+            if (a.conversation_id) store.enqueue('meta_reminder',payload);
+            else store.notify('warning','Rappel cliente impossible : ce rendez-vous manuel ne possède pas de conversation liée.');
+            store.run('UPDATE appointments SET reminder_queued_start=? WHERE id=?',a.start_at,a.id);
+          }
+          store.db.exec('COMMIT');
+        } catch(e) { store.db.exec('ROLLBACK'); throw e; }
+      }
     }
   }
   async function importHistory() {

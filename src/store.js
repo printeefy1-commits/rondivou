@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { appointmentTimes, extract } from './domain.js';
 import { contextKey } from './ai.js';
+import { reminderSchedule } from './reminders.js';
 export function createStore(path = '.data/rondivou.sqlite') {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
@@ -19,12 +20,29 @@ export function createStore(path = '.data/rondivou.sqlite') {
     CREATE TABLE IF NOT EXISTS telegram_updates(id TEXT PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS ai_analyses(conversation_id TEXT PRIMARY KEY REFERENCES conversations(id), context_key TEXT NOT NULL, result TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS telegram_cards(conversation_id TEXT NOT NULL REFERENCES conversations(id), chat_id TEXT NOT NULL, message_id TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(conversation_id,chat_id));
+    CREATE TABLE IF NOT EXISTS reminder_events(appointment_id TEXT NOT NULL REFERENCES appointments(id),version TEXT NOT NULL,stage TEXT NOT NULL,due_at TEXT NOT NULL,start_at TEXT NOT NULL,queued_at TEXT NOT NULL,telegram_sent_at TEXT,meta_sent_at TEXT,PRIMARY KEY(appointment_id,version,stage));
     CREATE INDEX IF NOT EXISTS appointment_range ON appointments(start_at,end_at);
     CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id,sent_at);
   `);
   // Keep account metadata for existing bookings and a cutoff against replayed imports.
   const conversationColumns = new Set(db.prepare('PRAGMA table_info(conversations)').all().map(c => c.name));
   for (const column of ['deleted_at','cleared_at']) if (!conversationColumns.has(column)) db.exec(`ALTER TABLE conversations ADD COLUMN ${column} TEXT`);
+  const appointmentColumns = new Set(db.prepare('PRAGMA table_info(appointments)').all().map(c => c.name));
+  for (const column of ['attendance_confirmed_at','reminder_version','reminder_reset_at']) if (!appointmentColumns.has(column)) db.exec(`ALTER TABLE appointments ADD COLUMN ${column} TEXT`);
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const a of db.prepare('SELECT * FROM appointments WHERE reminder_version IS NULL').all()) {
+      const version = randomUUID();
+      const confirmed = a.reminder_sent_at && a.status === 'confirmed' ? a.updated_at : null;
+      db.prepare('UPDATE appointments SET reminder_version=?,reminder_reset_at=?,attendance_confirmed_at=? WHERE id=?').run(version,a.created_at,confirmed,a.id);
+      // A reminder already delivered by the old policy must not be sent again.
+      const evening = reminderSchedule(a.start_at)[0];
+      if (a.reminder_sent_at && evening) db.prepare('INSERT OR IGNORE INTO reminder_events VALUES(?,?,?,?,?,?,?,?)').run(a.id,version,'evening',evening.dueAt,a.start_at,a.reminder_sent_at,a.reminder_sent_at,a.reminder_sent_at);
+    }
+    // Retire unsent 24-hour jobs; the new scheduler will use the new fixed times.
+    db.prepare("DELETE FROM outbox WHERE sent_at IS NULL AND ((kind='meta_reminder' AND json_extract(payload,'$.stage') IS NULL) OR (kind='telegram' AND substr(json_extract(payload,'$.text'),1,length(?))=?))").run('🔔 Rendez-vous dans 24 h','🔔 Rendez-vous dans 24 h');
+    db.exec('COMMIT');
+  } catch(e) { db.exec('ROLLBACK'); throw e; }
   const all = (q, ...args) => db.prepare(q).all(...args);
   const get = (q, ...args) => db.prepare(q).get(...args);
   const run = (q, ...args) => db.prepare(q).run(...args);
@@ -74,7 +92,8 @@ export function createStore(path = '.data/rondivou.sqlite') {
     if (new Date(start) <= reference) throw Object.assign(new Error('Le rendez-vous doit être dans le futur.'), { status: 400 });
     db.exec('BEGIN IMMEDIATE');
     try {
-      if (updateId && !get('SELECT id FROM appointments WHERE id=?', updateId)) throw Object.assign(new Error('Rendez-vous introuvable.'), { status: 404 });
+      const previous = updateId && get('SELECT * FROM appointments WHERE id=?',updateId);
+      if (updateId && !previous) throw Object.assign(new Error('Rendez-vous introuvable.'), { status: 404 });
       if (input.source_message_id) {
         const existing = get('SELECT * FROM appointments WHERE source_message_id=?', input.source_message_id);
         if (existing && existing.id !== updateId) throw Object.assign(new Error('Ce message a déjà un rendez-vous.'), { status: 409 });
@@ -82,8 +101,11 @@ export function createStore(path = '.data/rondivou.sqlite') {
       const conflict = get("SELECT id FROM appointments WHERE status!='cancelled' AND start_at<? AND end_at>? AND id!=?", end, start, updateId || '');
       if (conflict) throw Object.assign(new Error('Créneau indisponible : un autre rendez-vous occupe cette période.'), { status: 409 });
       const id = updateId || randomUUID(), stamp = now();
-      if (updateId) run("UPDATE appointments SET client_name=?,phone=?,service=?,start_at=?,end_at=?,notes=?,status='confirmed',reminder_sent_at=NULL,reminder_queued_start=NULL,updated_at=? WHERE id=?", input.client_name || '', input.phone || '', input.service, start, end, input.notes || '', stamp, id);
-      else run('INSERT INTO appointments(id,conversation_id,source_message_id,client_name,phone,service,start_at,end_at,status,notes,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)', id, input.conversation_id || null, input.source_message_id || null, input.client_name || '', input.phone || '', input.service, start, end, 'confirmed', input.notes || '', stamp, stamp);
+      if (updateId) {
+        const reset = previous.start_at !== start || previous.end_at !== end || previous.service !== input.service || previous.status === 'cancelled';
+        run('UPDATE appointments SET client_name=?,phone=?,service=?,start_at=?,end_at=?,notes=?,status=?,reminder_sent_at=?,reminder_queued_start=?,attendance_confirmed_at=?,reminder_version=?,reminder_reset_at=?,updated_at=? WHERE id=?',input.client_name || '',input.phone || '',input.service,start,end,input.notes || '',reset ? 'confirmed' : previous.status,reset ? null : previous.reminder_sent_at,reset ? null : previous.reminder_queued_start,reset ? null : previous.attendance_confirmed_at,reset ? randomUUID() : previous.reminder_version,reset ? stamp : previous.reminder_reset_at,stamp,id);
+      }
+      else run('INSERT INTO appointments(id,conversation_id,source_message_id,client_name,phone,service,start_at,end_at,status,notes,created_at,updated_at,reminder_version,reminder_reset_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', id, input.conversation_id || null, input.source_message_id || null, input.client_name || '', input.phone || '', input.service, start, end, 'confirmed', input.notes || '', stamp, stamp,randomUUID(),stamp);
       if (input.conversation_id) run("UPDATE reviews SET status='resolved' WHERE conversation_id=? AND status='pending'", input.conversation_id);
       const a = get('SELECT * FROM appointments WHERE id=?', id);
       const account = input.conversation_id && get('SELECT username,channel FROM conversations WHERE id=?', input.conversation_id);

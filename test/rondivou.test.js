@@ -86,15 +86,15 @@ test('non-text attachments are ignored and both text directions are retained', t
   assert.equal(messages.length, 2); assert.deepEqual(messages.map(m => m.direction), ['in', 'out']);
   assert.equal(messages[0].conversation_id, messages[1].conversation_id);
 });
-test('reminders skip bookings made under 24h, queue once for manual bookings, and never auto-cancel', t => {
+test('fixed evening reminders skip late bookings, queue once for manual bookings, and never auto-cancel', t => {
   const { store, integration } = setup(t);
   const a = store.book({ date: future, time: '10:00', service: 'maquillage' });
   store.run('UPDATE appointments SET created_at=? WHERE id=?', '2030-06-10T01:00:00Z', a.id);
-  integration.scheduleReminders(new Date('2030-06-09T09:00:00Z'));
+  integration.scheduleReminders(new Date('2030-06-09T18:00:00Z'));
   assert.equal(store.get("SELECT COUNT(*) AS n FROM notifications WHERE kind='reminder'").n, 0);
   store.run('UPDATE appointments SET created_at=? WHERE id=?', '2030-06-01T01:00:00Z', a.id);
-  integration.scheduleReminders(new Date('2030-06-09T09:00:00Z'));
-  integration.scheduleReminders(new Date('2030-06-09T09:01:00Z'));
+  integration.scheduleReminders(new Date('2030-06-09T18:00:00Z'));
+  integration.scheduleReminders(new Date('2030-06-09T18:01:00Z'));
   assert.equal(store.get("SELECT COUNT(*) AS n FROM notifications WHERE kind='reminder'").n, 1);
   assert.equal(store.get('SELECT status FROM appointments').status, 'confirmed');
 });
@@ -112,25 +112,28 @@ test('only authorized private Telegram account can act; old imports open form in
   assert.match(store.all('SELECT payload FROM outbox ORDER BY rowid').at(-1).payload, /validation manuelle/);
 });
 test('Meta client errors preserve pending reminder and surface delivery failure', async t => {
+  t.mock.timers.enable({apis:['Date'],now:Date.parse('2030-06-08T10:00:00Z')});
   const store = createStore(':memory:'); t.after(() => store.close());
   const integration = integrations(store, { META_PAGE_ACCESS_TOKEN: 'test', META_PAGE_ID: 'page' }, async () => ({ ok: false, status: 400, json: async () => ({ error: { code: 10 } }) }));
   const c = store.conversation('messenger', 'c', 'Cliente');
   const a = store.book({ date: future, time: '10:00', service: 'maquillage', conversation_id: c.id });
   store.run('DELETE FROM outbox');
-  store.enqueue('meta_reminder', { appointmentId: a.id, startAt: a.start_at });
+  t.mock.timers.setTime(Date.parse('2030-06-09T18:00:00Z')); integration.scheduleReminders();
+  store.run("DELETE FROM outbox WHERE kind='telegram_reminder'");
   await integration.flush();
   assert.equal(store.get('SELECT status FROM appointments').status, 'confirmed');
   assert.equal(store.get('SELECT attempts FROM outbox').attempts, 1);
   assert.equal(store.get('SELECT reminder_sent_at FROM appointments').reminder_sent_at, null);
 });
 test('successful client reminder waits for confirmation; reply updates existing appointment', async t => {
+  t.mock.timers.enable({apis:['Date'],now:Date.parse('2030-06-08T10:00:00Z')});
   const store = createStore(':memory:'); t.after(() => store.close());
   const integration = integrations(store, { META_PAGE_ACCESS_TOKEN: 'test', META_PAGE_ID: 'page' }, async () => ({ ok: true, json: async () => ({ message_id: 'reminder' }) }));
   const c = store.conversation('messenger', 'client-1', 'Sarah');
   const a = store.book({ date: future, time: '10:00', service: 'maquillage', conversation_id: c.id });
-  store.run('DELETE FROM outbox'); store.enqueue('meta_reminder', { appointmentId: a.id, startAt: a.start_at });
+  store.run('DELETE FROM outbox');t.mock.timers.setTime(Date.parse('2030-06-09T18:00:00Z'));integration.scheduleReminders();store.run("DELETE FROM outbox WHERE kind='telegram_reminder'");
   await integration.flush(); assert.equal(store.get('SELECT status FROM appointments').status, 'waiting_confirmation');
-  integration.ingest(incoming({ text: 'Je confirme', messageId: 'reply' }));
+  integration.ingest(incoming({ text: 'Je confirme', messageId: 'reply',sentAt:'2030-06-09T18:01:00Z' }));
   assert.equal(store.get('SELECT status FROM appointments').status, 'confirmed');
   assert.equal(store.get('SELECT COUNT(*) AS n FROM appointments').n, 1);
 });
