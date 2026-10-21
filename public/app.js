@@ -6,6 +6,7 @@ const today = () => localDate(new Date());
 const format = (date, opts) => new Intl.DateTimeFormat('fr-DZ', { timeZone: 'Africa/Algiers', ...opts }).format(new Date(date));
 const clock = date => format(date, { hour: '2-digit', minute: '2-digit', hour12: false });
 const addDays = (date, n) => new Date(new Date(`${date}T12:00:00+01:00`).getTime() + n * 86400000).toISOString().slice(0, 10);
+let conversationQuery = '', conversationResults = [], searchTimer, searchVersion = 0;
 let state, selectedDate = today(), mode = window.innerWidth < 760 ? 'day' : 'week', currentView = 'calendar', currentConversation, toastTimeout;
 const service = id => state?.services.find(s => s.id === id);
 const statusLabel = status => ({ confirmed: 'Confirmé', waiting_confirmation: 'Attente de confirmation', cancelled: 'Annulé' }[status] || status);
@@ -36,6 +37,7 @@ async function refresh() {
   state = await api('/dashboard');
   $('#shell').hidden = false; $('#login').hidden = true; $('#password-change').hidden = true;
   render();
+  if (conversationQuery) searchConversations();
 }
 function render() {
   $('#stat-today').textContent = state.appointments.filter(a => a.status !== 'cancelled' && localDate(a.start_at) === today()).length;
@@ -96,11 +98,37 @@ function renderFollow() {
   $$('[data-appointment]', $('#follow-list')).forEach(b => b.onclick = () => showAppointment(state.appointments.find(a => a.id === b.dataset.appointment)));
 }
 function renderConversationList() {
-  $('#conversation-list').innerHTML = state.conversations.length ? state.conversations.map(c => `<button class="conversation-card ${currentConversation === c.id ? 'selected' : ''}" data-id="${c.id}"><div class="conversation-card-top"><strong>${escape(c.username)}</strong><span class="channel-badge ${c.channel === 'instagram' ? 'instagram' : 'facebook'}">${c.channel === 'instagram' ? 'IG' : 'FB'}</span></div><small>${c.review_count ? '<span class="review-dot"></span> À vérifier · ' : ''}Dernier échange : ${escape(c.last_at ? format(c.last_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }) : '—')}</small><small class="conversation-start" title="Date du premier message disponible dans Rondivou">Début : ${escape(format(c.started_at || c.created_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }))}</small><p>${escape(c.last_text)}</p></button>`).join('') : '<div class="empty-state"><span>↗</span><h3>Votre prochain échange arrive bientôt.</h3><p>Connectez Meta pour recevoir vos conversations.</p><button id="empty-connect" class="outline">Configurer les connexions</button></div>';
-  $$('.conversation-card').forEach(b => b.onclick = () => openConversation(b.dataset.id));
+  const conversations = conversationQuery ? conversationResults : state.conversations;
+  $('#conversation-list').innerHTML = conversations.length ? conversations.map(c => `<button class="conversation-card ${currentConversation === c.id ? 'selected' : ''}" data-id="${c.id}" data-match-id="${escape(c.match_message_id || '')}"><div class="conversation-card-top"><strong>${escape(c.username)}</strong><span class="channel-badge ${c.channel === 'instagram' ? 'instagram' : 'facebook'}">${c.channel === 'instagram' ? 'IG' : 'FB'}</span></div><small>${c.review_count ? '<span class="review-dot"></span> À vérifier · ' : ''}Dernier échange : ${escape(c.last_at ? format(c.last_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }) : '—')}</small><small class="conversation-start" title="Date du premier message disponible dans Rondivou">Début : ${escape(format(c.started_at || c.created_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }))}</small><p>${c.match_text ? '<span class="search-match-label">Message correspondant</span>' : ''}${escape(c.match_text || c.last_text)}</p></button>`).join('') : conversationQuery ? '<div class="empty-state"><h3>Aucune conversation trouvée.</h3><p>Essayez un autre nom ou d’autres mots.</p></div>' : '<div class="empty-state"><span>↗</span><h3>Votre prochain échange arrive bientôt.</h3><p>Connectez Meta pour recevoir vos conversations.</p><button id="empty-connect" class="outline">Configurer les connexions</button></div>';
+  $$('.conversation-card').forEach(b => b.onclick = () => openConversation(b.dataset.id,b.dataset.matchId));
   if ($('#empty-connect')) $('#empty-connect').onclick = () => switchView('settings');
 }
-async function openConversation(id) {
+async function searchConversations() {
+  const version = ++searchVersion, query = conversationQuery;
+  if (!query) { conversationResults = []; renderConversationList(); return; }
+  $('#conversation-search-status').textContent = 'Recherche en cours…';
+  try {
+    const result = await api('/conversations/search?q=' + encodeURIComponent(query));
+    if (version !== searchVersion) return;
+    conversationResults = result.conversations;
+    renderConversationList();
+    $('#conversation-search-status').textContent = `${conversationResults.length} conversation${conversationResults.length === 1 ? '' : 's'} trouvée${conversationResults.length === 1 ? '' : 's'}.`;
+  } catch(e) {
+    if (version === searchVersion) $('#conversation-search-status').textContent = e.message;
+  }
+}
+$('#conversation-search').oninput = () => {
+  clearTimeout(searchTimer); ++searchVersion;
+  conversationQuery = $('#conversation-search').value.trim(); conversationResults = [];
+  $('#clear-conversation-search').hidden = !$('#conversation-search').value;
+  $('#conversation-search-status').textContent = conversationQuery ? 'Recherche en cours…' : 'Recherche dans tous les messages, y compris l’historique importé.';
+  if (!conversationQuery) renderConversationList();
+  else searchTimer = setTimeout(searchConversations,250);
+};
+$('#clear-conversation-search').onclick = () => {
+  $('#conversation-search').value = ''; $('#conversation-search').oninput(); $('#conversation-search').focus();
+};
+async function openConversation(id, matchId) {
   try {
     const changingConversation = currentConversation !== id;
     const previousList = !changingConversation && $('.message-list');
@@ -111,13 +139,14 @@ async function openConversation(id) {
     const candidate = c.candidate;
     const historical = c.reviews.some(r => r.reason === 'historical');
     const latest = c.messages.at(-1);
-    $('#conversation-detail').innerHTML = `<div class="conversation-header"><div><h2>${escape(c.username)}</h2><small>${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.messages.length} messages</small><small class="conversation-start">Début des échanges disponibles : ${escape(format(c.started_at || c.messages[0]?.sent_at || c.created_at, { dateStyle: 'long', timeStyle: 'short', hour12: false }))}</small><span class="message-order">↓ Derniers messages en bas</span></div><button class="outline small" id="dismiss-review">Marquer comme traité</button></div><div class="message-list">${c.messages.map(m => `<div class="message ${m.direction === 'out' ? 'out' : ''}" dir="auto"><small>${m.direction === 'out' ? 'Salon' : 'Cliente'} · ${escape(format(m.sent_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }))}${m.historical ? ' · Historique' : ''}</small>${escape(m.text)}</div>`).join('')}</div><div class="candidate-panel"><div class="candidate-values"><span>◷ ${escape(candidate.date || 'Date manquante')}</span><span>${escape(candidate.time || 'Heure manquante')}</span><span>${escape(service(candidate.service)?.name || 'Prestation manquante')}</span></div><p>${candidate.ai_pending ? 'Analyse IA en attente. Vous pouvez compléter le formulaire manuellement.' : historical ? 'Historique : vérifiez le contexte et la date avant de créer un rendez-vous.' : candidate.ambiguous ? 'Plusieurs informations possibles : sélectionnez les bonnes valeurs dans le formulaire.' : 'Vérifiez les informations avant de confirmer le rendez-vous.'}</p><div class="candidate-actions">${candidate.source === 'ai' || candidate.ai_pending ? '<button class="outline" id="analyze-conversation">Analyser avec IA</button>' : ''}<button class="primary" id="plan-conversation">rondivou ↗</button><button class="outline" id="confirm-conversation">rondivou confirmé</button></div></div>`;
+    $('#conversation-detail').innerHTML = `<div class="conversation-header"><div><h2>${escape(c.username)}</h2><small>${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.messages.length} messages</small><small class="conversation-start">Début des échanges disponibles : ${escape(format(c.started_at || c.messages[0]?.sent_at || c.created_at, { dateStyle: 'long', timeStyle: 'short', hour12: false }))}</small><span class="message-order">↓ Derniers messages en bas</span></div><button class="outline small" id="dismiss-review">Marquer comme traité</button></div><div class="message-list">${c.messages.map(m => `<div data-message-id="${escape(m.id)}" class="message ${m.id === matchId ? 'search-match ' : ''}${m.direction === 'out' ? 'out' : ''}" dir="auto"><small>${m.direction === 'out' ? 'Salon' : 'Cliente'} · ${escape(format(m.sent_at, { dateStyle: 'short', timeStyle: 'short', hour12: false }))}${m.historical ? ' · Historique' : ''}</small>${escape(m.text)}</div>`).join('')}</div><div class="candidate-panel"><div class="candidate-values"><span>◷ ${escape(candidate.date || 'Date manquante')}</span><span>${escape(candidate.time || 'Heure manquante')}</span><span>${escape(service(candidate.service)?.name || 'Prestation manquante')}</span></div><p>${candidate.ai_pending ? 'Analyse IA en attente. Vous pouvez compléter le formulaire manuellement.' : historical ? 'Historique : vérifiez le contexte et la date avant de créer un rendez-vous.' : candidate.ambiguous ? 'Plusieurs informations possibles : sélectionnez les bonnes valeurs dans le formulaire.' : 'Vérifiez les informations avant de confirmer le rendez-vous.'}</p><div class="candidate-actions">${candidate.source === 'ai' || candidate.ai_pending ? '<button class="outline" id="analyze-conversation">Analyser avec IA</button>' : ''}<button class="primary" id="plan-conversation">rondivou ↗</button><button class="outline" id="confirm-conversation">rondivou confirmé</button></div></div>`;
     if ($('#analyze-conversation')) $('#analyze-conversation').onclick = async () => { try { await api(`/conversations/${id}/analyze`, { method: 'POST', body: '{}' }); toast('Analyse IA programmée.'); } catch (e) { toast(e.message); } };
     const plan = () => openBooking({ ...candidate, conversation_id: c.id, source_message_id: latest?.id || '', context: `${c.channel === 'instagram' ? 'Instagram' : 'Messenger'} · ${c.username}${historical ? ' · Import historique : validation manuelle' : ''}` });
     $('#plan-conversation').onclick = plan; $('#confirm-conversation').onclick = plan;
     $('#dismiss-review').onclick = async () => { try { await api(`/conversations/${id}/dismiss`, { method: 'POST', body: '{}' }); await refresh(); toast('Conversation marquée comme traitée.'); } catch (e) { toast(e.message); } };
     const messageList = $('.message-list');
     messageList.scrollTop = followLatest ? messageList.scrollHeight : previousScroll;
+    if (matchId) $$('.message',messageList).find(m => m.dataset.messageId === matchId)?.scrollIntoView({block:'center'});
     if (changingConversation && window.innerWidth <= 760) $('#conversation-detail').scrollIntoView({ block: 'start' });
   } catch (e) { toast(e.message); }
 }

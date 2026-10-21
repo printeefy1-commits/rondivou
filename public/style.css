@@ -187,3 +187,12 @@ input:focus, select:focus, textarea:focus { outline-color: #69bca8; }
 .password-screen label { margin-top: 18px; }
 .password-screen .outline { width: 100%; margin-top: 12px; }
 @media (min-width: 761px) { .sidebar { overflow-y: auto; scrollbar-width: thin; } }
+
+.conversation-search { margin-bottom: 18px; }
+.conversation-search label { display:block; font-size:16px; font-weight:700; margin-bottom:9px; }
+.conversation-search-row { display:flex; gap:10px; }
+.conversation-search-row input { flex:1; min-width:0; background:#fff; font-size:17px; }
+.conversation-search-row button { flex-shrink:0; }
+.conversation-search p { margin:9px 0 0; color:var(--muted); font-size:14px; }
+.search-match-label { display:block; color:var(--green); font-size:12px; font-weight:700; margin-bottom:4px; }
+.message.search-match { outline: 3px solid #167d73; outline-offset: -3px; background: #e6f7f1; }

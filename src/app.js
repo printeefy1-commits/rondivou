@@ -11,6 +11,8 @@ export function createApp(store, config, request, audit = record => console.info
   app.disable('x-powered-by');
   const integration = integrations(store, config, request);
   const auth = passwords(store, config);
+  const searchText = value => String(value ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('fr');
+  store.db.function('search_contains', { deterministic: true }, (text, query) => Number(searchText(text).includes(searchText(query))));
   const failures = new Map();
   let importRunning = false;
   app.use((req, res, next) => {
@@ -108,6 +110,22 @@ export function createApp(store, config, request, audit = record => console.info
     }
   });
   app.use('/api',(_req,res,next) => auth.required() ? res.status(403).json({error:'Choisissez votre nouveau mot de passe pour continuer.',code:'password_change_required'}) : next());
+  app.get('/api/conversations/search', (req,res) => {
+    if (typeof req.query.q !== 'string' || req.query.q.length > 200) return res.status(400).json({error:'Saisissez une recherche de 200 caractères maximum.'});
+    const query=req.query.q.trim();
+    if (!query) return res.json({conversations:[]});
+    const conversations=store.all(`SELECT c.*,
+      (SELECT text FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_text,
+      (SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at,
+      (SELECT COUNT(*) FROM reviews WHERE conversation_id=c.id AND status='pending') AS review_count,
+      (SELECT sent_at FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_at,
+      (SELECT text FROM messages WHERE conversation_id=c.id AND search_contains(text,?) ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS match_text,
+      (SELECT id FROM messages WHERE conversation_id=c.id AND search_contains(text,?) ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS match_message_id
+      FROM conversations c WHERE search_contains(c.username,?) OR EXISTS
+        (SELECT 1 FROM messages WHERE conversation_id=c.id AND search_contains(text,?))
+      ORDER BY last_at DESC,c.created_at DESC,c.id`,query,query,query,query);
+    res.json({conversations});
+  });
   app.get('/api/dashboard', (_req, res) => {
     const conversations = store.all(`SELECT c.*, (SELECT text FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC,rowid DESC LIMIT 1) AS last_text,
       (SELECT MIN(sent_at) FROM messages WHERE conversation_id=c.id) AS started_at,
